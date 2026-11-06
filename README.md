@@ -21,8 +21,8 @@
 > This repository is a modified fork based on the original [cifertech/ESP32‑DIV](https://github.com/cifertech/ESP32‑DIV).
 
 > ⚡ **Skip the IDE** — No PlatformIO / Arduino IDE required.
+
 > Download and flash firmware binaries with our online web flasher:
->
 > 🔗 https://k-spade.github.io/Spade-K-WebFlasher
 
 

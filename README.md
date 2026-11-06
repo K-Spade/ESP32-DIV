@@ -21,6 +21,7 @@
 > This repository is modified fork based on original [cifertech/ESP32‑DIV](https://github.com/cifertech/ESP32‑DIV).
 
 > ⚡ **Skip the IDE** — Flash firmware binary from Releases.
+> [cifertech/ESP32‑DIV](https://k-spade.github.io/Spade-K-WebFlasher)
 
 <div>&nbsp;</div>
 

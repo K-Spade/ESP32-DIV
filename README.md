@@ -18,10 +18,13 @@
 &nbsp;
 
 ## 📖 Wiki
-> This repository is modified fork based on original [cifertech/ESP32‑DIV](https://github.com/cifertech/ESP32‑DIV).
+> This repository is a modified fork based on the original [cifertech/ESP32‑DIV](https://github.com/cifertech/ESP32‑DIV).
 
-> ⚡ **Skip the IDE** — Flash firmware binary from Releases.
-> [cifertech/ESP32‑DIV](https://k-spade.github.io/Spade-K-WebFlasher)
+> ⚡ **Skip the IDE** — No PlatformIO / Arduino IDE required.
+> Download and flash firmware binaries with our online web flasher:
+>
+> 🔗 https://k-spade.github.io/Spade-K-WebFlasher
+
 
 <div>&nbsp;</div>
 

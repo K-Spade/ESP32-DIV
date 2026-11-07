@@ -1,6 +1,8 @@
 #include "SettingsStore.h"
 #include "Touchscreen.h"
 #include "config.h"
+#include "DivRfEngine.h"
+#include "DivRfProfilesController.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "icon.h"
@@ -152,11 +154,9 @@ static void bleWaitNavRelease(int pin1, int pin2 = -1, int pin3 = -1) {
 // The electrical supply fault has been corrected on the DIV 2.1 PCB. Keep
 // the official fixed RF24 output level and vary only the number of radios.
 static constexpr rf24_pa_dbm_e kNrfFixedPower = RF24_PA_MAX;
-// nRF24L01+ specifies a 10 MHz maximum SPI clock. The former 16 MHz setting
-// was out of spec and became especially unreliable after PN532 software-SPI
-// had reversed the GPIO11/GPIO13 directions. 4 MHz leaves ample margin; SPI
-// is used only for register/FIFO access and does not reduce over-air RF rate.
-static constexpr uint32_t kNrfSpiHz = 4000000;
+// V1.81 definitive build: all nRF profiles use the fenced 80 us engine.
+// The shared-bus recovery still runs before every feature that owns the pins.
+static constexpr uint32_t kNrfSpiHz = 10000000;
 
 static bool beginNrfRadioReliable(RF24& radio) {
   for (uint8_t attempt = 0; attempt < 4u; ++attempt) {
@@ -4164,24 +4164,11 @@ void exit() {
 
 namespace BleJammer {
 
-RF24 radio1(CE_PIN_1, CSN_PIN_1, kNrfSpiHz);
-RF24 radio2(CE_PIN_2, CSN_PIN_2, kNrfSpiHz);
-RF24 radio3(CE_PIN_3, CSN_PIN_3, kNrfSpiHz);
-
 enum OperationMode { BLE_MODULE, Bluetooth_MODULE };
 OperationMode currentMode = BLE_MODULE;
 
 bool jammerActive = false;
-static bool radio3Active = false;
 void updateTFT();
-
-int bluetooth_channels[] = {32, 34, 46, 48, 50, 52, 0, 1, 2, 4, 6, 8, 22, 24, 26, 28, 30, 74, 76, 78, 80};
-int ble_channels[] = {2, 26, 80};
-
-const byte BLE_channels[] = {2, 26, 80};
-byte channelGroup1[] = {2, 5, 8, 11};
-byte channelGroup2[] = {26, 29, 32, 35};
-byte channelGroup3[] = {80, 83, 86, 89};
 
 #define SCREEN_HEIGHT 320
 #define LINE_HEIGHT 12
@@ -4265,67 +4252,36 @@ void checkButtons() {
     modeChangeRequested = true;
     lastButtonPressTime = currentTime;
   }
+
 }
 
-void configureRadio(RF24 &radio, const byte* channels, size_t size) {
-
-  radio.setAutoAck(false);
-  radio.stopListening();
-  radio.setRetries(0, 0);
-  radio.setPALevel(RF24_PA_MAX, true);
-  radio.setDataRate(RF24_2MBPS);
-  radio.setCRCLength(RF24_CRC_DISABLED);
-  radio.printPrettyDetails();
-  radio.startConstCarrier(RF24_PA_MAX, 45);
-
-
-  // for (size_t i = 0; i < size; i++) {
-  //   radio.setChannel(channels[i]);
-  //   radio.startConstCarrier(kNrfFixedPower, channels[i]);
-  // }
+static DivRfEngine::Profile selectedProfile() {
+  return currentMode == BLE_MODULE ? DivRfEngine::Profile::Ble
+                                   : DivRfEngine::Profile::Bluetooth;
 }
 
-void initializeRadiosMultiMode() {
-  bool radio1Active = false;
-  bool radio2Active = false;
-  radio3Active = false;
-  nrfApplyActiveRadioSelection();
-  prepareNrfSharedSpiBus();
+static bool initializeRadios() {
+  if (!jammerActive) {
+    if (DivRfEngine::isActive()) {
+      DivRfEngine::stop(DivRfEngine::StopReason::User);
+    }
+    return true;
+  }
 
-  if (beginNrfRadioReliable(radio1)) {
-    radio1Active = true;
+  if (DivRfEngine::isActive()) {
+    DivRfEngine::stop(DivRfEngine::StopReason::ModeChange);
   }
-  if (beginNrfRadioReliable(radio2)) {
-    radio2Active = true;
-  }
-  if (thirdNrfEnabled() && beginNrfRadioReliable(radio3)) {
-    radio3Active = true;
-  }
-  if (radio1Active) {
-    configureRadio(radio1, channelGroup1, sizeof(channelGroup1));
-  }
-  if (radio2Active) {
-    configureRadio(radio2, channelGroup2, sizeof(channelGroup2));
-  }
-  if (radio3Active) {
-    configureRadio(radio3, channelGroup3, sizeof(channelGroup3));
-  }
-  Serial.printf("[nrf] BLE Jammer NRF1=%s NRF2=%s NRF3=%s fixed PA=MAX\n",
-                radio1Active ? "OK" : "MISS", radio2Active ? "OK" : "MISS",
-                radio3Active ? "OK" : (thirdNrfEnabled() ? "MISS" : "OFF"));
-}
-
-void initializeRadios() {
-  if (jammerActive) {
-    initializeRadiosMultiMode();
-
-  } else {
-    radio1.powerDown();
-    radio2.powerDown();
-    if (radio3Active) radio3.powerDown();
-    radio3Active = false;
-    nrfApplyActiveRadioSelection();
-  }
+  const bool started = DivRfEngine::start(selectedProfile());
+  const DivRfEngine::Snapshot& state = DivRfEngine::snapshot();
+  Serial.printf("[nrf] BLE Jammer profile=%s radios=%u ready=%u/%u/%u "
+                "PA_MAX=%u/%u/%u start=%s\n",
+                DivRfEngine::profileName(selectedProfile()),
+                state.selectedRadios, state.ready[0], state.ready[1],
+                state.ready[2], state.maximumPowerVerified[0],
+                state.maximumPowerVerified[1], state.maximumPowerVerified[2],
+                started ? "OK" : "FAIL");
+  if (!started) jammerActive = false;
+  return started;
 }
 
 void updateTFT() {
@@ -4382,24 +4338,27 @@ void checkModeChange() {
   if (modeChangeRequested) {
     modeChangeRequested = false;
     currentMode = static_cast<OperationMode>((currentMode + 1) % 2);
-    initializeRadios();
+    const bool modeReady = initializeRadios();
     updateTFT();
 
     String modeText = "[+] Mode changed to: ";
     modeText += (currentMode == BLE_MODULE) ? "BLE" : "Bluetooth";
     Print(modeText, UI_TEXT, false);
+    if (!modeReady) Print("[!] RF engine start failed", UI_WARN, false);
   }
 
   if (jammerToggleRequested) {
     jammerToggleRequested = false;
     jammerActive = !jammerActive;
-    initializeRadios();
+    const bool jammerReady = initializeRadios();
     updateTFT();
 
     String jammerText = "[!] Jammer ";
     jammerText += (jammerActive) ? "Activated" : "Deactivated";
     Print(jammerText, UI_WARN, false);
+    if (!jammerReady) Print("[!] RF engine start failed", UI_WARN, false);
   }
+
 }
 
 void blejamSetup() {
@@ -4414,7 +4373,10 @@ void blejamSetup() {
   drawStatusBar(currentBatteryVoltage, true);
   redrawTouchButtonBar();
 
-  initializeRadios();
+  jammerActive = false;
+  if (DivRfEngine::isActive()) {
+    DivRfEngine::stop(DivRfEngine::StopReason::Reinitialize);
+  }
   setupTouchscreen();
   updateTFT();
 
@@ -4432,42 +4394,47 @@ void blejamSetup() {
 
 void blejamLoop() {
 
-unsigned int chSel;
-  while (1) {
-    if (feature_active && isButtonPressed(BTN_SELECT)) {
-      feature_exit_requested = true;
-      return;
-    }
-
-    checkModeChange();
-
-    if (jammerActive) {
-      if (currentMode == BLE_MODULE) {
-        chSel = bluetooth_channels[ random( sizeof(bluetooth_channels)/sizeof(bluetooth_channels[0]) ) ];
-        radio1.setChannel(chSel);
-        chSel = bluetooth_channels[ random( sizeof(bluetooth_channels)/sizeof(bluetooth_channels[0]) ) ];
-        radio2.setChannel(chSel);
-        delayMicroseconds(random(1,13));
-
-
-      } else if (currentMode == Bluetooth_MODULE) {
-        chSel = bluetooth_channels[ random( sizeof(bluetooth_channels)/sizeof(bluetooth_channels[0]) ) ];
-        radio1.setChannel(chSel);
-        chSel = bluetooth_channels[ random( sizeof(bluetooth_channels)/sizeof(bluetooth_channels[0]) ) ];
-        radio2.setChannel(chSel);
-        delayMicroseconds(random(1,13));
-      }
-    }
-    // Yield to the scheduler so the idle task/watchdog and core-0 radio stack get
-    // CPU time; without this the tight loop starves the system and everything lags.
+  if (feature_active && (feature_exit_requested || isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    feature_exit_requested = true;
+    return;
   }
+
+  checkModeChange();
+
+  uint32_t fastLoopCount = 0;
+  while (jammerActive) {
+    // Poll controls less often than RF_CH to preserve the tight-loop test.
+    // UP follows the official toggle path and powers all three radios down;
+    // SELECT/the touch Exit control still leaves the feature safely.
+    if ((fastLoopCount & 0x1Fu) == 0) {
+      if (feature_active && (feature_exit_requested || isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+        feature_exit_requested = true;
+        jammerActive = false;
+        initializeRadios();
+        break;
+      }
+      checkModeChange();
+      if (!jammerActive) break;
+    }
+
+    DivRfEngine::service();
+    if (!DivRfEngine::isActive()) {
+      jammerActive = false;
+      updateTFT();
+      Print("[!] RF engine stopped", UI_WARN, false);
+      break;
+    }
+
+    ++fastLoopCount;
+  }
+
+  if (!jammerActive) delay(1);
 }
 
 void exit() {
 
   jammerActive = false;
-  initializeRadios();
-  releaseSharedSpiWithoutSdMount();
+  DivRfEngine::stop(DivRfEngine::StopReason::Exit);
 }
 }
 
@@ -6362,30 +6329,11 @@ void exit() {
 
 namespace ProtoKill {
 
-RF24 radio1(CE_PIN_1, CSN_PIN_1, kNrfSpiHz);
-RF24 radio2(CE_PIN_2, CSN_PIN_2, kNrfSpiHz);
-RF24 radio3(CE_PIN_3, CSN_PIN_3, kNrfSpiHz);
-
 enum OperationMode { BLE_MODULE, Bluetooth_MODULE, WiFi_MODULE, VIDEO_TX_MODULE, RC_MODULE, USB_WIRELESS_MODULE, ZIGBEE_MODULE, NRF24_MODULE };
 OperationMode currentMode = WiFi_MODULE;
 
 bool jammerActive = false;
-static bool radio3Active = false;
 void updateTFT();
-
-const byte bluetooth_channels[] =        {32, 34, 46, 48, 50, 52, 0, 1, 2, 4, 6, 8, 22, 24, 26, 28, 30, 74, 76, 78, 80};
-const byte ble_channels[] =              {2, 26, 80};
-const byte WiFi_channels[] =             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
-const byte usbWireless_channels[] =      {40, 50, 60};
-const byte videoTransmitter_channels[] = {70, 75, 80};
-const byte rc_channels[] =               {1, 3, 5, 7};
-const byte zigbee_channels[] =           {11, 15, 20, 25};
-const byte nrf24_channels[] =            {76, 78, 79};
-
-const byte BLE_channels[] = {2, 26, 80};
-byte channelGroup1[] = {2, 5, 8, 11};
-byte channelGroup2[] = {26, 29, 32, 35};
-byte channelGroup3[] = {80, 83, 86, 89};
 
 #define SCREEN_HEIGHT 320
 #define LINE_HEIGHT 12
@@ -6483,58 +6431,31 @@ void prokillHandleNavButtons() {
   }
 }
 
-void configureRadio(RF24 &radio, const byte* channels, size_t size) {
-  radio.setAutoAck(false);
-  radio.stopListening();
-  radio.setRetries(0, 0);
-  radio.setPALevel(RF24_PA_MAX, true);
-  radio.setDataRate(RF24_2MBPS);
-  radio.setCRCLength(RF24_CRC_DISABLED);
-  radio.printPrettyDetails();
-  radio.startConstCarrier(RF24_PA_MAX, 45);
-}
+static bool initializeRadios() {
+  const uint8_t profileIndex = static_cast<uint8_t>(currentMode);
+  const bool selectionReady =
+      DivRfProfilesController::selectIndex(profileIndex);
 
-void initializeRadiosMultiMode() {
-  bool radio1Active = false;
-  bool radio2Active = false;
-  radio3Active = false;
-  nrfApplyActiveRadioSelection();
-  prepareNrfSharedSpiBus();
+  if (!jammerActive) {
+    if (DivRfEngine::isActive()) {
+      DivRfEngine::stop(DivRfEngine::StopReason::User);
+    }
+    return selectionReady;
+  }
 
-  if (beginNrfRadioReliable(radio1)) {
-    radio1Active = true;
+  bool started = selectionReady;
+  if (started && !DivRfEngine::isActive()) {
+    started = DivRfProfilesController::startSelected();
   }
-  if (beginNrfRadioReliable(radio2)) {
-    radio2Active = true;
-  }
-  if (thirdNrfEnabled() && beginNrfRadioReliable(radio3)) {
-    radio3Active = true;
-  }
-  if (radio1Active) {
-    configureRadio(radio1, channelGroup1, sizeof(channelGroup1));
-  }
-  if (radio2Active) {
-    configureRadio(radio2, channelGroup2, sizeof(channelGroup2));
-  }
-  if (radio3Active) {
-    configureRadio(radio3, channelGroup3, sizeof(channelGroup3));
-  }
-  Serial.printf("[nrf] ProtoKill NRF1=%s NRF2=%s NRF3=%s fixed PA=MAX\n",
-                radio1Active ? "OK" : "MISS", radio2Active ? "OK" : "MISS",
-                radio3Active ? "OK" : (thirdNrfEnabled() ? "MISS" : "OFF"));
-}
-
-void initializeRadios() {
-  if (jammerActive) {
-    initializeRadiosMultiMode();
-
-  } else {
-    radio1.powerDown();
-    radio2.powerDown();
-    if (radio3Active) radio3.powerDown();
-    radio3Active = false;
-    nrfApplyActiveRadioSelection();
-  }
+  const DivRfEngine::Snapshot& state = DivRfEngine::snapshot();
+  Serial.printf("[nrf] ProtoKill profile=%s radios=%u ready=%u/%u/%u "
+                "PA_MAX=%u/%u/%u start=%s\n",
+                DivRfProfilesController::selectedName(), state.selectedRadios,
+                state.ready[0], state.ready[1], state.ready[2],
+                state.maximumPowerVerified[0], state.maximumPowerVerified[1],
+                state.maximumPowerVerified[2], started ? "OK" : "FAIL");
+  if (!started) jammerActive = false;
+  return started;
 }
 
 void updateTFT() {
@@ -6605,26 +6526,30 @@ void checkModeChange() {
   if (modeChangeRequested) {
     modeChangeRequested = false;
     currentMode = static_cast<OperationMode>((currentMode + 1) % 8);
-    initializeRadios();
+    const bool modeReady = initializeRadios();
     updateTFT();
     printModeChange(currentMode);
+    if (!modeReady) Print("[!] RF engine start failed", UI_WARN, false);
   }
 
   if (modeChangeRequested1) {
     modeChangeRequested1 = false;
     currentMode = static_cast<OperationMode>((currentMode == 0) ? 7 : (currentMode - 1));
-    initializeRadios();
+    const bool modeReady = initializeRadios();
     updateTFT();
     printModeChange(currentMode);
+    if (!modeReady) Print("[!] RF engine start failed", UI_WARN, false);
   }
 
   if (jammerToggleRequested) {
     jammerToggleRequested = false;
     jammerActive = !jammerActive;
-    initializeRadios();
+    const bool jammerReady = initializeRadios();
     updateTFT();
     printJammerStatus(jammerActive);
+    if (!jammerReady) Print("[!] RF engine start failed", UI_WARN, false);
   }
+
 }
 
 void prokillSetup() {
@@ -6639,9 +6564,9 @@ void prokillSetup() {
   drawStatusBar(currentBatteryVoltage, true);
   redrawTouchButtonBar();
 
+  jammerActive = false;
+  DivRfProfilesController::reset(static_cast<uint8_t>(currentMode));
   updateTFT();
-
-  initializeRadios();
   setupTouchscreen();
 
 #if HAS_PCF8574_BUTTONS
@@ -6657,98 +6582,56 @@ void prokillSetup() {
 }
 
 void prokillLoop() {
-uint8_t chSel;
-  while (1) {
-    if (feature_active && (feature_exit_requested || isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
-      feature_exit_requested = true;
-      return;
-    }
 
-    maintainTouchNavBar();
-    tft.drawFastHLine(0, 19, 240, UI_LINE);
-
-    checkModeChange();
-
-    if (jammerActive) {
-      if (currentMode == BLE_MODULE) {
-        chSel = bluetooth_channels[ random( sizeof(bluetooth_channels)/sizeof(bluetooth_channels[0]) ) ];
-        radio1.setChannel(chSel);
-        chSel = bluetooth_channels[ random( sizeof(bluetooth_channels)/sizeof(bluetooth_channels[0]) ) ];
-        radio2.setChannel(chSel);
-        delayMicroseconds(random(1,13));
-        // radio3.setChannel(channel);
-
-      } else if (currentMode == Bluetooth_MODULE) {
-        chSel = ble_channels[ random( sizeof(ble_channels)/sizeof(ble_channels[0]) ) ];
-        radio1.setChannel(chSel);
-        chSel = ble_channels[ random( sizeof(ble_channels)/sizeof(ble_channels[0]) ) ];
-        radio2.setChannel(chSel);
-        delayMicroseconds(random(1,13));
-
-      } else if (currentMode == WiFi_MODULE) {
-        chSel = WiFi_channels[ random( sizeof(WiFi_channels)/sizeof(WiFi_channels[0]) ) ];
-        radio1.setChannel(chSel);
-        chSel = WiFi_channels[ random( sizeof(WiFi_channels)/sizeof(WiFi_channels[0]) ) ];
-        radio2.setChannel(chSel);
-        delayMicroseconds(random(1,13));
-
-      } else if (currentMode == USB_WIRELESS_MODULE) {
-        chSel = usbWireless_channels[ random( sizeof(usbWireless_channels)/sizeof(usbWireless_channels[0]) ) ];
-        radio1.setChannel(chSel);
-        chSel = usbWireless_channels[ random( sizeof(usbWireless_channels)/sizeof(usbWireless_channels[0]) ) ];
-        radio2.setChannel(chSel);
-        delayMicroseconds(random(1,13));
-
-      } else if (currentMode == VIDEO_TX_MODULE) {
-        chSel = videoTransmitter_channels[ random( sizeof(videoTransmitter_channels)/sizeof(videoTransmitter_channels[0]) ) ];
-        radio1.setChannel(chSel);
-        chSel = videoTransmitter_channels[ random( sizeof(videoTransmitter_channels)/sizeof(videoTransmitter_channels[0]) ) ];
-        radio2.setChannel(chSel);
-        delayMicroseconds(random(1,13));
-
-      } else if (currentMode == RC_MODULE) {
-        chSel = rc_channels[ random( sizeof(rc_channels)/sizeof(rc_channels[0]) ) ];
-        radio1.setChannel(chSel);
-        chSel = rc_channels[ random( sizeof(rc_channels)/sizeof(rc_channels[0]) ) ];
-        radio2.setChannel(chSel);
-        delayMicroseconds(random(1,13));
-
-      } else if (currentMode == ZIGBEE_MODULE) {
-        chSel = zigbee_channels[ random( sizeof(zigbee_channels)/sizeof(zigbee_channels[0]) ) ];
-        radio1.setChannel(chSel);
-        chSel = zigbee_channels[ random( sizeof(zigbee_channels)/sizeof(zigbee_channels[0]) ) ];
-        radio2.setChannel(chSel);
-        delayMicroseconds(random(1,13));
-
-      } else if (currentMode == NRF24_MODULE) {
-        chSel = nrf24_channels[ random( sizeof(nrf24_channels)/sizeof(nrf24_channels[0]) ) ];
-        radio1.setChannel(chSel);
-        chSel = nrf24_channels[ random( sizeof(nrf24_channels)/sizeof(nrf24_channels[0]) ) ];
-        radio2.setChannel(chSel);
-        delayMicroseconds(random(1,13));
-      }
-    }
+  if (feature_active && (feature_exit_requested || isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    feature_exit_requested = true;
+    return;
   }
 
-  // Yield to the scheduler so the idle task/watchdog and core-0 radio stack get
-  // CPU time; without this the tight loop starves the system and everything lags.
-  delay(1);
+  checkModeChange();
+
+  uint32_t fastLoopCount = 0;
+  while (jammerActive) {
+    // Use the same stable fast-hop engine as BLE Jammer.  The upstream
+    // ProtoKill path performed one hop followed by delay(1), which reduced the
+    // channel update rate by orders of magnitude and behaved very differently.
+    if ((fastLoopCount & 0x1Fu) == 0) {
+      if (feature_active &&
+          (feature_exit_requested || isButtonPressed(BTN_SELECT) ||
+           featureExitButtonPressed())) {
+        feature_exit_requested = true;
+        jammerActive = false;
+        initializeRadios();
+        break;
+      }
+      checkModeChange();
+      if (!jammerActive) break;
+    }
+
+    DivRfProfilesController::service();
+    if (!DivRfEngine::isActive()) {
+      jammerActive = false;
+      updateTFT();
+      Print("[!] RF engine stopped", UI_WARN, false);
+      break;
+    }
+
+    ++fastLoopCount;
+  }
+
+  if (!jammerActive) {
+    maintainTouchNavBar();
+    tft.drawFastHLine(0, 19, 240, UI_LINE);
+    delay(1);
+  }
 }
 
 void exit() {
-  // Without this, leaving the feature keeps the radios running
-  // startConstCarrier() at the selected PA level: a permanent 2.4 GHz
-  // transmission that makes the ESP32's own WiFi/BLE and UI sluggish.
   jammerActive = false;
   modeChangeRequested = false;
   modeChangeRequested1 = false;
   jammerToggleRequested = false;
-  radio1.powerDown();
-  radio2.powerDown();
-  if (radio3Active) radio3.powerDown();
-  radio3Active = false;
-  nrfApplyActiveRadioSelection();
-  releaseSharedSpiWithoutSdMount();
+  DivRfProfilesController::exit();
 }
 
 }  // namespace ProtoKill

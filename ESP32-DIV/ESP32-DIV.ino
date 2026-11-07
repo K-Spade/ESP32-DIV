@@ -4760,43 +4760,46 @@ void handleAboutPage() {
   tft.setTextFont(1);
   tft.setTextColor(UI_DIM_TEXT, UI_BG);
   tft.setCursor(12, 60);
-    tft.print("1.7.2-stable-by_MK_SIGNAL_V1.67");
+  tft.print("1.7.2-stable-by_MK_SIGNAL_V1.81");
 
   tft.drawFastHLine(12, 78, 216, UI_LINE);
 
+  // Keep translated labels on their own line. Several localized labels are
+  // wider than their English key (for example Spanish "Compilacion" and the
+  // Cyrillic/CJK variants), so a fixed two-column layout caused collisions
+  // with the value. Stacked rows remain stable in every supported language.
   const int xLabel = 14;
-  const int xValue = 58;
-  int y = 96;
-  const int step = 30;
+  const int labelY = 88;
+  const int valueOffset = 14;
+  const int blockStep = 34;
 
-  tft.setTextColor(UI_DIM_TEXT, UI_BG);
-  tft.setCursor(xLabel, y);
-  tft.print("Board");
-  tft.setTextColor(UI_TEXT, UI_BG);
-  tft.setCursor(xValue, y);
-  tft.print("ESP32 DIV V2.1 by MK");
-  y += step;
+  auto drawAboutRow = [&](int y, const char* label, const char* value) {
+    tft.setTextColor(UI_DIM_TEXT, UI_BG);
+    tft.setCursor(xLabel, y);
+    tft.print(label);
+    tft.setTextColor(UI_TEXT, UI_BG);
+    tft.setCursor(xLabel, y + valueOffset);
+    tft.print(value);
+  };
 
-  tft.setTextColor(UI_DIM_TEXT, UI_BG);
-  tft.setCursor(xLabel, y);
-  tft.print("Build");
-  tft.setTextColor(UI_TEXT, UI_BG);
-  tft.setCursor(xValue, y);
-  tft.print("V1.67 Stable by MK SIGNAL");
-  y += step;
+  drawAboutRow(labelY, "Board", "ESP32 DIV V2.1 by MK");
+  drawAboutRow(labelY + blockStep, "Build", "V1.81 Stable by MK SIGNAL");
+  drawAboutRow(labelY + blockStep * 2, "Source Code",
+               "github.com/K-Spade/ESP32-DIV");
 
+  const int creditsY = labelY + blockStep * 3;
   tft.setTextColor(UI_DIM_TEXT, UI_BG);
-  tft.setCursor(xLabel, y);
+  tft.setCursor(xLabel, creditsY);
   tft.print("Credits");
   tft.setTextColor(UI_TEXT, UI_BG);
-  tft.setCursor(xLabel, y + 15);
+  tft.setCursor(xLabel, creditsY + 14);
   tft.print("CiferTech ESP32 DIV Project");
 
-  tft.setCursor(xLabel, y + 31);
+  tft.setCursor(xLabel, creditsY + 29);
   tft.print("MK SIGNAL");
-  tft.setCursor(xLabel, y + 47);
+  tft.setCursor(xLabel, creditsY + 44);
   tft.print("tyrannosaurus_pcb");
-  tft.setCursor(xLabel, y + 63);
+  tft.setCursor(xLabel, creditsY + 59);
   tft.print("netcat_0");
 
   // The built-in font does not contain the Unicode black-heart glyph. Draw
@@ -4809,13 +4812,13 @@ void handleAboutPage() {
   const char* thankYou = "Thank you CiferTech for your work";
   tft.setTextColor(0xC618, UI_BG);  // light grey
   tft.setTextDatum(MC_DATUM);
-  tft.drawString(thankYou, TFT_WIDTH / 2, 273);
-  drawCreditHeart(9, 273, 0xC618);
-  drawCreditHeart(TFT_WIDTH - 9, 273, 0xC618);
+  tft.drawString(thankYou, TFT_WIDTH / 2, 282);
+  drawCreditHeart(9, 282, 0xC618);
+  drawCreditHeart(TFT_WIDTH - 9, 282, 0xC618);
   tft.setTextDatum(TL_DATUM);
 
   tft.setTextColor(UI_DIM_TEXT, UI_BG);
-  tft.setCursor(16, 300);
+  tft.setCursor(16, 304);
   tft.print("SELECT / tap to go back");
 
   while (!feature_exit_requested) {

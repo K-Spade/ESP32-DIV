@@ -3,6 +3,7 @@
 #include "driver/rmt.h"
 #include "freertos/ringbuf.h"
 #include "KeyboardUI.h"
+#include "NrfSupervisor.h"
 #include "Touchscreen.h"
 #include "config.h"
 #include "icon.h"
@@ -2014,8 +2015,12 @@ static void replayDeselectSharedSpiSlaves() {
   digitalWrite(CSN_PIN_2, HIGH);
 #endif
 #if defined(CSN_PIN_3)
-  pinMode(CSN_PIN_3, OUTPUT);
-  digitalWrite(CSN_PIN_3, HIGH);
+  if (nrfIrHardwareAvailable()) {
+    pinMode(CSN_PIN_3, INPUT_PULLUP);
+  } else {
+    pinMode(CSN_PIN_3, OUTPUT);
+    digitalWrite(CSN_PIN_3, HIGH);
+  }
 #endif
 #if defined(CC1101_CS)
   pinMode(CC1101_CS, OUTPUT);

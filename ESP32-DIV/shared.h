@@ -103,7 +103,7 @@ uint16_t uiUniversalColor();
 #define ESP32DIV_NAME "MK SIGNAL DIV V2.1"
 #endif
 #ifndef ESP32DIV_VERSION
-#define ESP32DIV_VERSION "1.7.2-stable-by_MK_SIGNAL_v1.67"
+#define ESP32DIV_VERSION "1.7.2-stable-by_MK_SIGNAL_v1.81"
 #endif
 #ifndef ESP32DIV_TARGET
 #define ESP32DIV_TARGET "for DIV V2.1"
@@ -680,7 +680,7 @@ static const uint8_t OBF_WB[]   = {75, 97, 110, 109, 122, 92, 109, 107, 96, 38, 
 #elif defined(BOARD_ESP32_DIV_V1)
 #define IR_RX_PIN 4
 #else
-#define IR_RX_PIN 21
+#define IR_RX_PIN 42
 #endif
 #endif
 #ifndef IR_TX_PIN
@@ -689,7 +689,7 @@ static const uint8_t OBF_WB[]   = {75, 97, 110, 109, 122, 92, 109, 107, 96, 38, 
 #elif defined(BOARD_ESP32_DIV_V1)
 #define IR_TX_PIN 5
 #else
-#define IR_TX_PIN 14
+#define IR_TX_PIN 41
 #endif
 #endif
 #ifndef IR_DEFAULT_KHZ

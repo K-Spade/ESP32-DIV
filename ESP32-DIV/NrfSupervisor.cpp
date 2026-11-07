@@ -10,6 +10,55 @@ namespace {
 
 uint8_t s_detectedCount = 2;
 bool s_irReceiverDetected = false;
+constexpr uint32_t kNrfSpiHz = 10000000;
+
+static bool probeIrReceiverElectrical() {
+  // The original DIV V2.1 population leaves two independent electrical
+  // fingerprints on the NRF3 nets:
+  //   GPIO14 -> Q1 base resistor / base-emitter junction
+  //   GPIO21 -> actively driven idle-high VS1838B output
+  // Test both before RF24 is allowed to select NRF3. The previous pulldown
+  // test could overpower a weak receiver output and falsely classify an IR
+  // board as a valid third-radio board.
+
+  pinMode(CE_PIN_3, INPUT_PULLUP);
+  delay(2);
+  uint8_t q1LowSamples = 0;
+  constexpr uint8_t kQ1Samples = 32;
+  for (uint8_t i = 0; i < kQ1Samples; ++i) {
+    if (digitalRead(CE_PIN_3) == LOW) ++q1LowSamples;
+    delayMicroseconds(50);
+  }
+  const bool q1Present = q1LowSamples >= 24u;
+  pinMode(CE_PIN_3, OUTPUT);
+  digitalWrite(CE_PIN_3, LOW);  // Q1 off and NRF3 CE inactive.
+
+  // Discharge GPIO21 briefly using open drain, then completely release it.
+  // A fitted VS1838B restores the line HIGH on every pass. A bare nRF CSN
+  // input is high impedance and cannot restore the discharged node.
+  uint8_t receiverRiseRounds = 0;
+  constexpr uint8_t kRiseRounds = 8;
+  for (uint8_t round = 0; round < kRiseRounds; ++round) {
+    pinMode(IR_RX_PIN, OUTPUT_OPEN_DRAIN);
+    digitalWrite(IR_RX_PIN, LOW);
+    delayMicroseconds(80);
+    pinMode(IR_RX_PIN, INPUT);
+    delayMicroseconds(25);
+    const bool earlyHigh = digitalRead(IR_RX_PIN) == HIGH;
+    delayMicroseconds(175);
+    const bool settledHigh = digitalRead(IR_RX_PIN) == HIGH;
+    if (earlyHigh && settledHigh) ++receiverRiseRounds;
+  }
+  const bool receiverPresent = receiverRiseRounds >= 6u;
+  const bool detected = q1Present || receiverPresent;
+
+  Serial.printf(
+      "[ir-detect] Q1 low=%u/%u VS1838 rise=%u/%u -> %s\n",
+      (unsigned)q1LowSamples, (unsigned)kQ1Samples,
+      (unsigned)receiverRiseRounds, (unsigned)kRiseRounds,
+      detected ? "IR topology" : "NRF3 topology");
+  return detected;
+}
 
 static bool probeRadio(uint8_t ce, uint8_t csn) {
   // Validate the electrical bus before RF24 mutates registers.  Besides
@@ -22,7 +71,7 @@ static bool probeRadio(uint8_t ce, uint8_t csn) {
     return false;
   }
 
-  RF24 probe(ce, csn, 4000000);
+  RF24 probe(ce, csn, kNrfSpiHz);
   bool connected = false;
   for (uint8_t attempt = 0; attempt < 6u && !connected; ++attempt) {
     connected = probe.begin() && probe.isChipConnected();
@@ -34,14 +83,19 @@ static bool probeRadio(uint8_t ce, uint8_t csn) {
   return connected;
 }
 
-static bool configureIrFromBoardTopology(bool thirdRadioPresent) {
+static bool configureIrFromBoardTopology(bool thirdRadioPresent,
+                                         bool receiverElectricallyPresent) {
   // DIV V2.1 has two supported, mutually exclusive populations on the shared
   // GPIO14/GPIO21 nets: the original board fits Q1 + VS1838B and therefore
   // only two nRF radios; the three-radio modification removes those IR parts.
-  // A logic-level probe is not reliable here because the VS1838B output can
-  // be weakly pulled and looks identical to a floating CSN3 input. Use the
-  // already verified NRF3 response as the authoritative hardware discriminator.
+  // The electrical receiver probe has priority. This prevents a floating or
+  // contended SPI read on an original IR board from being accepted as NRF3.
   digitalWrite(CE_PIN_3, LOW);
+  if (receiverElectricallyPresent) {
+    pinMode(IR_RX_PIN, INPUT_PULLUP);
+    Serial.println(F("[ir-detect] VS1838B present -> NRF3 disabled"));
+    return true;
+  }
   if (thirdRadioPresent) {
     pinMode(CSN_PIN_3, OUTPUT);
     digitalWrite(CSN_PIN_3, HIGH);
@@ -54,7 +108,7 @@ static bool configureIrFromBoardTopology(bool thirdRadioPresent) {
   pinMode(IR_RX_PIN, INPUT_PULLUP);
   pinMode(CE_PIN_3, OUTPUT);
   digitalWrite(CE_PIN_3, LOW);
-  Serial.println(F("[ir-detect] two-radio DIV topology -> IR hardware enabled"));
+  Serial.println(F("[ir-detect] two-radio fallback -> IR hardware enabled"));
   return true;
 }
 
@@ -66,7 +120,23 @@ void nrfSupervisorInit(bool restoreSd) {
   pinMode(CE_PIN_3, OUTPUT);  digitalWrite(CE_PIN_3, LOW);
   pinMode(CSN_PIN_1, OUTPUT); digitalWrite(CSN_PIN_1, HIGH);
   pinMode(CSN_PIN_2, OUTPUT); digitalWrite(CSN_PIN_2, HIGH);
-  pinMode(CSN_PIN_3, OUTPUT); digitalWrite(CSN_PIN_3, HIGH);
+
+  // This must be the first operation on GPIO21. Once CSN3 has been driven by
+  // the MCU it is no longer possible to distinguish the VS1838B idle output
+  // from the level written by firmware.
+  // Once an original IR population has been identified, keep that topology
+  // latched for the whole boot. A remote may be transmitting while the bus is
+  // rebuilt after NFC; re-probing its active-low output at that instant must
+  // not reclassify the board as a three-radio unit.
+  const bool irElectricalPresent =
+      s_irReceiverDetected || probeIrReceiverElectrical();
+  s_irReceiverDetected = irElectricalPresent;
+  if (irElectricalPresent) {
+    pinMode(CSN_PIN_3, INPUT_PULLUP);
+  } else {
+    pinMode(CSN_PIN_3, OUTPUT);
+    digitalWrite(CSN_PIN_3, HIGH);
+  }
 
   bool first = false;
   bool second = false;
@@ -81,7 +151,9 @@ void nrfSupervisorInit(bool restoreSd) {
     prepareNrfSharedSpiBus();
     first = probeRadio(CE_PIN_1, CSN_PIN_1);
     second = probeRadio(CE_PIN_2, CSN_PIN_2);
-    third = probeRadio(CE_PIN_3, CSN_PIN_3);
+    // Never toggle GPIO21 as CSN when the receiver is populated. NRF3 is
+    // mutually exclusive with IR on the supported DIV V2.1 PCB topology.
+    third = irElectricalPresent ? false : probeRadio(CE_PIN_3, CSN_PIN_3);
     if (first && second) break;
 
     Serial.printf("[nrf-detect] shared bus recovery round %u/3\n",
@@ -91,11 +163,16 @@ void nrfSupervisorInit(bool restoreSd) {
     digitalWrite(CE_PIN_3, LOW);
     digitalWrite(CSN_PIN_1, HIGH);
     digitalWrite(CSN_PIN_2, HIGH);
-    digitalWrite(CSN_PIN_3, HIGH);
+    if (irElectricalPresent) {
+      pinMode(CSN_PIN_3, INPUT_PULLUP);
+    } else {
+      digitalWrite(CSN_PIN_3, HIGH);
+    }
     delay((unsigned long)round * 12UL);
   }
   s_detectedCount = third ? 3u : 2u;
-  s_irReceiverDetected = configureIrFromBoardTopology(third);
+  s_irReceiverDetected = configureIrFromBoardTopology(
+      third, irElectricalPresent);
 
   Serial.printf("[nrf-detect] NRF1=%s NRF2=%s NRF3=%s -> hardware=%u IR=%s\n",
                 first ? "OK" : "MISS", second ? "OK" : "MISS",
@@ -116,7 +193,11 @@ void nrfSupervisorInit(bool restoreSd) {
     SPI.end();
     digitalWrite(CSN_PIN_1, HIGH);
     digitalWrite(CSN_PIN_2, HIGH);
-    digitalWrite(CSN_PIN_3, HIGH);
+    if (s_irReceiverDetected) {
+      pinMode(CSN_PIN_3, INPUT_PULLUP);
+    } else {
+      digitalWrite(CSN_PIN_3, HIGH);
+    }
     digitalWrite(CE_PIN_1, LOW);
     digitalWrite(CE_PIN_2, LOW);
     digitalWrite(CE_PIN_3, LOW);
@@ -135,7 +216,7 @@ bool nrfPrepareIrHardwareForUse() {
   // control, then release GPIO21 to the receiver and GPIO14 to IR TX.
   if (s_detectedCount >= 3u) {
     prepareNrfSharedSpiBus();
-    RF24 third(CE_PIN_3, CSN_PIN_3, 4000000);
+    RF24 third(CE_PIN_3, CSN_PIN_3, kNrfSpiHz);
     if (third.begin() && third.isChipConnected()) third.powerDown();
     digitalWrite(CE_PIN_3, LOW);
     digitalWrite(CSN_PIN_3, HIGH);

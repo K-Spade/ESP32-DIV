@@ -6,8 +6,8 @@
 void nrfSupervisorInit(bool restoreSd = true);
 
 uint8_t nrfDetectedHardwareCount();
-/** True only when the VS1838B output electrically holds the shared RX pin
- *  HIGH against a pulldown. This is independent of the number of nRF radios. */
+/** True when the original two-radio/VS1838B topology is selected. The
+ *  electrical GPIO21 probe has priority; a missing NRF3 is the safe fallback. */
 bool nrfIrHardwareAvailable();
 /** Isolate/power down NRF3, when present, before IR reuses GPIO14/GPIO21. */
 bool nrfPrepareIrHardwareForUse();

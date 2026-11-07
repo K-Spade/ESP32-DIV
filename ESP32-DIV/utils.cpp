@@ -1765,7 +1765,14 @@ static void sdReleaseOtherChipSelects() {
   sdRaiseCsPin(CSN_PIN_2);
 #endif
 #if defined(CSN_PIN_3)
-  sdRaiseCsPin(CSN_PIN_3);
+  // GPIO21 is CSN3 only on the three-radio population. On the original
+  // two-radio board it is the active-low VS1838B output and must never be
+  // driven by a generic SPI hand-off.
+  if (nrfIrHardwareAvailable()) {
+    pinMode(CSN_PIN_3, INPUT_PULLUP);
+  } else {
+    sdRaiseCsPin(CSN_PIN_3);
+  }
 #endif
   // Scanner and the RF24 features bit-bang CE/CSN on these pins.  Every CE
   // must be LOW before another shared-bus owner is allowed to start; leaving
@@ -2271,7 +2278,11 @@ void prepareNrfSharedSpiBus() {
   pinMode(CE_PIN_3, OUTPUT);  digitalWrite(CE_PIN_3, LOW);
   pinMode(CSN_PIN_1, OUTPUT); digitalWrite(CSN_PIN_1, HIGH);
   pinMode(CSN_PIN_2, OUTPUT); digitalWrite(CSN_PIN_2, HIGH);
-  pinMode(CSN_PIN_3, OUTPUT); digitalWrite(CSN_PIN_3, HIGH);
+  if (nrfIrHardwareAvailable()) {
+    pinMode(CSN_PIN_3, INPUT_PULLUP);
+  } else {
+    pinMode(CSN_PIN_3, OUTPUT); digitalWrite(CSN_PIN_3, HIGH);
+  }
 
 #if defined(SD_CS)
   pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
@@ -2484,8 +2495,12 @@ void releaseSharedSpiWithoutSdMount() {
   digitalWrite(CSN_PIN_2, HIGH);
 #endif
 #if defined(CSN_PIN_3)
-  pinMode(CSN_PIN_3, OUTPUT);
-  digitalWrite(CSN_PIN_3, HIGH);
+  if (nrfIrHardwareAvailable()) {
+    pinMode(CSN_PIN_3, INPUT_PULLUP);
+  } else {
+    pinMode(CSN_PIN_3, OUTPUT);
+    digitalWrite(CSN_PIN_3, HIGH);
+  }
 #endif
 #if defined(CE_PIN_1)
   pinMode(CE_PIN_1, OUTPUT);

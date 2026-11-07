@@ -1,0 +1,7 @@
+*.h text eol=lf
+*.cpp text eol=lf
+*.ino text eol=lf
+*.csv text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.svg text eol=lf

@@ -1,7 +1,6 @@
 
 # MK SIGNAL build artifacts
 .pio/
-build/
-*.elf
-*.map
+
+
 sdkconfig.old

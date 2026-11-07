@@ -24,6 +24,8 @@
 
 > Download and flash firmware binaries with our online web flasher:
 > 🔗 https://k-spade.github.io/Spade-K-WebFlasher
+# Firmware Download
+👉 [Latest Release](https://github.com/K-Spade/ESP32-DIV/releases)
 
 
 <div>&nbsp;</div>

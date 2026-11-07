@@ -4,7 +4,7 @@ $project = Split-Path -Parent $PSScriptRoot
 $environment = "mk-signal-div-v2-1-stable"
 $build = Join-Path $project ".pio\build\$environment"
 $dist = Join-Path $project "dist"
-$output = Join-Path $dist "ESP32-DIV-1.7.2-stable-by_MK_SIGNAL_v1.67-DIV-V2.1-full.bin"
+$output = Join-Path $dist "ESP32-DIV-1.7.2-stable-by_MK_SIGNAL_v1.81-DIV-V2.1-full.bin"
 $platformio = Join-Path $env:USERPROFILE ".platformio\penv\Scripts\platformio.exe"
 $python = Join-Path $env:USERPROFILE ".platformio\penv\Scripts\python.exe"
 $esptool = Join-Path $env:USERPROFILE ".platformio\packages\tool-esptoolpy\esptool.py"
@@ -34,14 +34,14 @@ try {
 
   $env:PLATFORMIO_CORE_DIR = "$coreDrive\"
   $shortProject = "$projectDrive\"
-  $shortPlatformio = "$coreDrive\penv\Scripts\platformio.exe"
+  $shortPython = "$coreDrive\penv\Scripts\python.exe"
 
-  & $shortPlatformio run --project-dir $shortProject --target clean
+  & $shortPython -m platformio run --project-dir $shortProject --target clean
   if ($LASTEXITCODE -ne 0) { throw "PlatformIO clean failed" }
 
   # Serial compilation also avoids intermittent CreateProcess failures when
   # several large C++ translation units start simultaneously.
-  & $shortPlatformio run --project-dir $shortProject -j 1
+  & $shortPython -m platformio run --project-dir $shortProject -j 1
   if ($LASTEXITCODE -ne 0) { throw "PlatformIO build failed" }
 }
 finally {

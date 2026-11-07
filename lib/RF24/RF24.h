@@ -240,6 +240,18 @@ public:
      */
     RF24(uint32_t _spi_speed = RF24_SPI_SPEED);
 
+    /** Change the SPI transaction speed before begin() or while CE is low. */
+    void setSPISpeed(uint32_t speed)
+    {
+        spi_speed = speed;
+    }
+
+    /** Return the SPI transaction speed configured for this instance. */
+    uint32_t getSPISpeed() const
+    {
+        return spi_speed;
+    }
+
 #if defined(RF24_LINUX)
     virtual ~RF24() {};
 #endif

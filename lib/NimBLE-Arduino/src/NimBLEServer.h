@@ -79,6 +79,10 @@ public:
     NimBLEConnInfo         getPeerInfo(size_t index);
     NimBLEConnInfo         getPeerInfo(const NimBLEAddress& address);
     NimBLEConnInfo         getPeerIDInfo(uint16_t id);
+    // Re-register retained services after NimBLEDevice::deinit(false) and a
+    // later host restart.  DIV intentionally retains the HID objects to avoid
+    // heap churn between foreground BLE tools.
+    void                   serviceChanged();
 #if !CONFIG_BT_NIMBLE_EXT_ADV || defined(_DOXYGEN_)
     void                   advertiseOnDisconnect(bool);
 #endif
@@ -111,7 +115,6 @@ private:
     std::vector<NimBLECharacteristic*> m_notifyChrVec;
 
     static int             handleGapEvent(struct ble_gap_event *event, void *arg);
-    void                   serviceChanged();
     void                   resetGATT();
     bool                   setIndicateWait(uint16_t conn_handle);
     void                   clearIndicateWait(uint16_t conn_handle);

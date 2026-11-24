@@ -4760,7 +4760,7 @@ void handleAboutPage() {
   tft.setTextFont(1);
   tft.setTextColor(UI_DIM_TEXT, UI_BG);
   tft.setCursor(12, 60);
-  tft.print("1.7.2-stable-by_MK_SIGNAL_V1.81");
+  tft.print("1.7.2-stable-by_MK_SIGNAL_V1.90");
 
   tft.drawFastHLine(12, 78, 216, UI_LINE);
 
@@ -4783,7 +4783,7 @@ void handleAboutPage() {
   };
 
   drawAboutRow(labelY, "Board", "ESP32 DIV V2.1 by MK");
-  drawAboutRow(labelY + blockStep, "Build", "V1.81 Stable by MK SIGNAL");
+  drawAboutRow(labelY + blockStep, "Build", "V1.90 Stable by MK SIGNAL");
   drawAboutRow(labelY + blockStep * 2, "Source Code",
                "github.com/K-Spade/ESP32-DIV");
 

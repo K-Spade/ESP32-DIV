@@ -1,4 +1,4 @@
-MK SIGNAL DIV V2.1 - V1.81 Stable
+MK SIGNAL DIV V2.1 - V1.90 Stable
 =================================
 
 PACKAGE CONTENTS
@@ -18,6 +18,19 @@ TARGET HARDWARE
 
 MK SIGNAL ESP32 DIV V2.1 based on ESP32-S3 with 16 MB flash.
 
+CUSTOM EVIL PORTAL HTML
+-----------------------
+
+Place .html or .htm files (up to 4 MiB each) in /portals/ on the microSD. Large
+pages are streamed in small chunks and do not need to fit in ESP32 RAM.
+Select the page from WiFi > Evil Portal > HTML. Forms may submit URL-encoded
+form data or JSON by POST to /login or another endpoint. Common identity field
+names such as username, user, email, login, account and phone are supported;
+password, pass, passwd, pwd and passphrase are accepted for the password. The
+optional placeholders {{SSID}} and {{DEVICE_NAME}} are replaced when the portal
+starts. JavaScript variables must still be transmitted with a form, fetch or
+XHR request for the firmware to receive them.
+
 BUILD REQUIREMENTS
 ------------------
 
@@ -35,7 +48,7 @@ Open PowerShell in this directory and run:
 
 The complete image will be created at:
 
-  dist\ESP32-DIV-1.7.2-stable-by_MK_SIGNAL_v1.81-DIV-V2.1-full.bin
+dist\ESP32-DIV-1.7.2-stable-by_MK_SIGNAL_v1.90-DIV-V2.1-full.bin
 
 FLASH THE COMPLETE IMAGE
 ------------------------
@@ -46,14 +59,14 @@ in internal flash but does not erase the microSD card.
 
   & "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "$env:USERPROFILE\.platformio\packages\tool-esptoolpy\esptool.py" --chip esp32s3 --port COM4 --baud 460800 erase_flash
 
-  & "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "$env:USERPROFILE\.platformio\packages\tool-esptoolpy\esptool.py" --chip esp32s3 --port COM4 --baud 921600 write_flash 0x0 ".\dist\ESP32-DIV-1.7.2-stable-by_MK_SIGNAL_v1.81-DIV-V2.1-full.bin"
+  & "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "$env:USERPROFILE\.platformio\packages\tool-esptoolpy\esptool.py" --chip esp32s3 --port COM4 --baud 921600 write_flash 0x0 ".\dist\ESP32-DIV-1.7.2-stable-by_MK_SIGNAL_v1.90-DIV-V2.1-full.bin"
 
 SUPPLIED IMAGE CHECKSUM
 -----------------------
 
 SHA-256:
-1A8CA5FA6071A03AB7CB5A3F7133BB77429FB02083D0B93A29C5A41028FCB24E
+AE311B55E29D128E98FC8737CCBFC993C446E2C100CCD718F9FC069CC51BBD4E
 
 Verify it with:
 
-  Get-FileHash -Algorithm SHA256 .\dist\ESP32-DIV-1.7.2-stable-by_MK_SIGNAL_v1.81-DIV-V2.1-full.bin
+Get-FileHash -Algorithm SHA256 .\dist\ESP32-DIV-1.7.2-stable-by_MK_SIGNAL_v1.90-DIV-V2.1-full.bin

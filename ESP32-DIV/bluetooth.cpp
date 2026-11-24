@@ -43,6 +43,12 @@ static int bleContentBottom() {
   return featureHasTouchNavBar() ? touchNavContentBottomY() : kBleScreenH;
 }
 
+static uint32_t s_bleStackGeneration = 0;
+
+uint32_t bleStackGeneration() {
+  return s_bleStackGeneration;
+}
+
 bool ensureBleStackReady() {
   // NimBLE can be deliberately deinitialised while a memory-heavy Wi-Fi
   // feature owns the radio.  Query the library instead of keeping a private
@@ -67,6 +73,7 @@ bool ensureBleStackReady() {
     Serial.printf("[ble] classic mem_release: %s\n", esp_err_to_name(rel));
   }
   BLEDevice::init(ESP32DIV_NAME);
+  ++s_bleStackGeneration;
   Serial.printf("[ble] init done, free heap=%u\n", (unsigned)ESP.getFreeHeap());
   return true;
 }

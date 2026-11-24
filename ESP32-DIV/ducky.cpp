@@ -2,12 +2,14 @@
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 #include <PCF8574.h>
+#include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <vector>
 #include "Touchscreen.h"
 #include "icon.h"
+#include "SettingsStore.h"
 #include "shared.h"
 #include "utils.h"
 
@@ -127,8 +129,21 @@ static bool pcfPressedEdge(EdgeBtn& eb, uint16_t debounceMs=40) {
 
 static NimBLEHIDDevice*      hid = nullptr;
 static NimBLECharacteristic* inputChr = nullptr;
+static NimBLECharacteristic* consumerInputChr = nullptr;
 static NimBLECharacteristic* outputChr = nullptr;
 static volatile bool         bleConnected = false;
+static volatile bool         bleSubscribed = false;
+static volatile bool         bleEncrypted = false;
+static volatile bool         bleAdvertising = false;
+// NimBLE removes a peer from its connection vector before invoking the
+// application disconnect callback.  exit() must therefore wait for this
+// counter as well as getConnectedCount()==0 before stopping the host.
+static volatile uint32_t     bleDisconnectEvents = 0;
+static uint32_t              hidStackGeneration = 0;
+
+static bool duckyReady() {
+  return bleConnected && bleSubscribed && inputChr != nullptr;
+}
 
 struct ScriptItem { String path, name, desc; uint32_t size = 0; };
 static std::vector<ScriptItem> items;
@@ -142,11 +157,13 @@ static void duckyUpdateNavLabels() {
     return;
   }
   if (page == Page::List) {
-    setTouchNavLabels("Exit", "Reload", "Open", "Prev", "Next");
+    // Match the physical D-pad: UP/DOWN always navigate the script list.
+    // Reload remains available on RIGHT and SELECT opens the highlighted item.
+    setTouchNavLabels("Exit", "Next", "Open", "Prev", "Reload");
   } else if (page == Page::Details) {
     setTouchNavLabels("Back", "Delete", "Run", "List", "Run");
   } else if (page == Page::Settings) {
-    setTouchNavLabels("Back", "Reload", "Open", "Prev", "Next");
+    setTouchNavLabels("Back", "Next", "Use", "Prev", "Next");
   }
   redrawTouchButtonBar();
 }
@@ -222,7 +239,6 @@ static bool touching = false;
 static uint32_t touchDownMs = 0;
 static int lastX = 0, lastY = 0;
 static const uint32_t TOUCH_DEBOUNCE_MS = 120;
-static const uint32_t DOUBLE_TAP_MS = 300;
 
 static Tap readTap() {
   Tap t{};
@@ -243,20 +259,38 @@ static Tap readTap() {
   return t;
 }
 
-static uint32_t lastTapTime = 0;
-static int lastTapX = 0, lastTapY = 0;
+// Track the logical script row instead of raw screen coordinates.  The first
+// tap redraws the selection and that redraw can exceed the old 300 ms window;
+// it also shifts a scrolling list, making coordinate-only matching unreliable.
+static int lastScriptTapIndex = -1;
+static uint32_t lastScriptTapTime = 0;
+static int lastScriptTapX = 0;
+static int lastScriptTapY = 0;
+static const uint32_t SCRIPT_DOUBLE_TAP_MS = 700;
 
-static bool isDoubleTap(const Tap& tap) {
-  if (!tap.has) return false;
-
-  uint32_t timeDiff = tap.time - lastTapTime;
-  int dist = abs(tap.x - lastTapX) + abs(tap.y - lastTapY);
-
-  lastTapTime = tap.time;
-  lastTapX = tap.x;
-  lastTapY = tap.y;
-
-  return (timeDiff < DOUBLE_TAP_MS && dist < 50);
+static int registerScriptRowTap(int index, const Tap& tap) {
+  if (!tap.has || index < 0) return -1;
+  const uint32_t elapsed = (uint32_t)(tap.time - lastScriptTapTime);
+  const int distance = abs(tap.x - lastScriptTapX) + abs(tap.y - lastScriptTapY);
+  // A selection redraw may recenter the visible list between both releases.
+  // Accept either the same logical item or the same physical double-tap area,
+  // and always execute the item selected by the first tap.
+  const bool isDouble = lastScriptTapIndex >= 0 &&
+      elapsed <= SCRIPT_DOUBLE_TAP_MS &&
+      (lastScriptTapIndex == index || distance <= 70);
+  if (isDouble) {
+    const int target = lastScriptTapIndex;
+    // Consume the gesture so a third tap starts a fresh pair.
+    lastScriptTapIndex = -1;
+    lastScriptTapTime = 0;
+    return target;
+  } else {
+    lastScriptTapIndex = index;
+    lastScriptTapTime = tap.time;
+    lastScriptTapX = tap.x;
+    lastScriptTapY = tap.y;
+  }
+  return -1;
 }
 
 static bool execFile(const String& path);
@@ -341,6 +375,7 @@ static bool ensureDuckyDir() {
   if (!SD.exists(DUCKY_DIR)) return SD.mkdir(DUCKY_DIR);
   return true;
 }
+
 static void parseMeta(File& f, ScriptItem& it) {
   it.desc = "";
   f.seek(0);
@@ -385,30 +420,179 @@ enum : uint8_t {
   KEY_ENTER = 0x28, KEY_ESC = 0x29, KEY_BACKSPACE = 0x2A, KEY_TAB = 0x2B, KEY_SPACE = 0x2C,
   KEY_MINUS = 0x2D, KEY_EQUAL = 0x2E, KEY_LEFTBRACE = 0x2F, KEY_RIGHTBRACE = 0x30, KEY_BACKSLASH = 0x31,
   KEY_SEMICOLON = 0x33, KEY_APOSTROPHE = 0x34, KEY_GRAVE = 0x35, KEY_COMMA = 0x36, KEY_DOT = 0x37, KEY_SLASH = 0x38,
-  KEY_CAPSLOCK = 0x39,
+  KEY_NONUS_HASH = 0x32, KEY_CAPSLOCK = 0x39,
   KEY_F1 = 0x3A, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
+  KEY_PRINTSCREEN = 0x46, KEY_SCROLLLOCK = 0x47, KEY_PAUSE = 0x48, KEY_INSERT = 0x49,
   KEY_HOME = 0x4A, KEY_PAGEUP = 0x4B, KEY_DELETE = 0x4C, KEY_END = 0x4D, KEY_PAGEDOWN = 0x4E,
-  KEY_RIGHT = 0x4F, KEY_LEFT = 0x50, KEY_DOWN = 0x51, KEY_UP = 0x52
+  KEY_RIGHT = 0x4F, KEY_LEFT = 0x50, KEY_DOWN = 0x51, KEY_UP = 0x52,
+  KEY_NUMLOCK = 0x53, KEY_KP_SLASH = 0x54, KEY_KP_ASTERISK = 0x55, KEY_KP_MINUS = 0x56,
+  KEY_KP_PLUS = 0x57, KEY_KP_ENTER = 0x58, KEY_KP_1 = 0x59, KEY_KP_2 = 0x5A,
+  KEY_KP_3 = 0x5B, KEY_KP_4 = 0x5C, KEY_KP_5 = 0x5D, KEY_KP_6 = 0x5E,
+  KEY_KP_7 = 0x5F, KEY_KP_8 = 0x60, KEY_KP_9 = 0x61, KEY_KP_0 = 0x62,
+  KEY_KP_DOT = 0x63, KEY_NONUS_BACKSLASH = 0x64, KEY_APP = 0x65, KEY_KP_EQUAL = 0x67,
+  KEY_F13 = 0x68, KEY_F14, KEY_F15, KEY_F16, KEY_F17, KEY_F18,
+  KEY_F19, KEY_F20, KEY_F21, KEY_F22, KEY_F23, KEY_F24
 };
-enum : uint8_t { MOD_CTRL=0x01, MOD_SHIFT=0x02, MOD_ALT=0x04, MOD_GUI=0x08 };
+enum : uint8_t {
+  MOD_CTRL=0x01, MOD_SHIFT=0x02, MOD_ALT=0x04, MOD_GUI=0x08,
+  MOD_RCTRL=0x10, MOD_RSHIFT=0x20, MOD_RALT=0x40, MOD_RGUI=0x80
+};
 struct __attribute__((packed)) KbdReport { uint8_t modifiers; uint8_t reserved; uint8_t keys[6]; };
+struct __attribute__((packed)) ConsumerReport { uint16_t usage; };
+
+enum class KeyboardLayout : uint8_t {
+  US, ES, LATAM, UK, DE, FR, IT, PT, Brazil, Custom, Count
+};
+
+struct KeyStroke {
+  uint8_t usage;
+  uint8_t mods;
+  constexpr KeyStroke(uint8_t key=0, uint8_t modifiers=0)
+      : usage(key), mods(modifiers) {}
+};
+
+static KeyboardLayout selectedLayout = KeyboardLayout::US;
+static KeyboardLayout activeLayout = KeyboardLayout::US;
+static KeyStroke customLayout[95];
+static bool customLayoutLoaded = false;
+
+static const char* layoutCode(KeyboardLayout layout) {
+  switch (layout) {
+    case KeyboardLayout::ES: return "ES";
+    case KeyboardLayout::LATAM: return "LATAM";
+    case KeyboardLayout::UK: return "UK";
+    case KeyboardLayout::DE: return "DE";
+    case KeyboardLayout::FR: return "FR";
+    case KeyboardLayout::IT: return "IT";
+    case KeyboardLayout::PT: return "PT";
+    case KeyboardLayout::Brazil: return "BR";
+    case KeyboardLayout::Custom: return "CUSTOM";
+    default: return "US";
+  }
+}
+
+static const char* layoutName(KeyboardLayout layout) {
+  switch (layout) {
+    case KeyboardLayout::ES: return "Spanish (Spain)";
+    case KeyboardLayout::LATAM: return "Spanish (Latin America)";
+    case KeyboardLayout::UK: return "English (United Kingdom)";
+    case KeyboardLayout::DE: return "German";
+    case KeyboardLayout::FR: return "French";
+    case KeyboardLayout::IT: return "Italian";
+    case KeyboardLayout::PT: return "Portuguese";
+    case KeyboardLayout::Brazil: return "Portuguese (Brazil)";
+    case KeyboardLayout::Custom: return "Custom SD layout";
+    default: return "English (United States)";
+  }
+}
+
+static bool parseLayoutCode(String code, KeyboardLayout& layout) {
+  code.trim(); code.toUpperCase();
+  if (code == "US" || code == "EN-US") layout = KeyboardLayout::US;
+  else if (code == "ES" || code == "ES-ES") layout = KeyboardLayout::ES;
+  else if (code == "LATAM" || code == "ES-LATAM" || code == "ES-MX") layout = KeyboardLayout::LATAM;
+  else if (code == "UK" || code == "GB" || code == "EN-GB") layout = KeyboardLayout::UK;
+  else if (code == "DE" || code == "DE-DE") layout = KeyboardLayout::DE;
+  else if (code == "FR" || code == "FR-FR") layout = KeyboardLayout::FR;
+  else if (code == "IT" || code == "IT-IT") layout = KeyboardLayout::IT;
+  else if (code == "PT" || code == "PT-PT") layout = KeyboardLayout::PT;
+  else if (code == "BR" || code == "PT-BR") layout = KeyboardLayout::Brazil;
+  else if (code == "CUSTOM") layout = KeyboardLayout::Custom;
+  else return false;
+  return true;
+}
+
+static KeyboardLayout defaultLayoutForUiLanguage() {
+  switch (settings().language) {
+    case UiLanguage::Spanish: return KeyboardLayout::ES;
+    case UiLanguage::Portuguese: return KeyboardLayout::PT;
+    default: return KeyboardLayout::US;
+  }
+}
+
+static void loadKeyboardLayoutPreference() {
+  Preferences prefs;
+  uint8_t saved = 0xFF;
+  if (prefs.begin("mk-signal", true)) {
+    saved = prefs.getUChar("duckyLayout", 0xFF);
+    prefs.end();
+  }
+  selectedLayout = saved < (uint8_t)KeyboardLayout::Count
+      ? (KeyboardLayout)saved : defaultLayoutForUiLanguage();
+  if (selectedLayout == KeyboardLayout::Custom && !customLayoutLoaded) {
+    selectedLayout = defaultLayoutForUiLanguage();
+  }
+  activeLayout = selectedLayout;
+}
+
+static void saveKeyboardLayoutPreference() {
+  Preferences prefs;
+  if (!prefs.begin("mk-signal", false)) return;
+  prefs.putUChar("duckyLayout", (uint8_t)selectedLayout);
+  prefs.end();
+}
 
 class ServerCB : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*) override { bleConnected = true; }
+  void onConnect(NimBLEServer*) override {
+    bleConnected = true;
+    bleSubscribed = false;
+    bleEncrypted = false;
+    bleAdvertising = false;
+    Serial.println(F("[ducky] BLE host connected; waiting for HID subscription"));
+  }
+  void onConnect(NimBLEServer* server, ble_gap_conn_desc* desc) override {
+    if (server && desc) {
+      server->updateConnParams(desc->conn_handle, 6, 12, 0, 300);
+      Serial.printf("[ducky] peer=%s handle=%u\n",
+                    NimBLEAddress(desc->peer_ota_addr).toString().c_str(),
+                    (unsigned)desc->conn_handle);
+    }
+  }
   void onDisconnect(NimBLEServer*) override {
     bleConnected = false;
+    bleSubscribed = false;
+    bleEncrypted = false;
 
     if (ducky_active) {
-      NimBLEDevice::startAdvertising();
+      bleAdvertising = NimBLEDevice::startAdvertising();
+      Serial.printf("[ducky] disconnected; advertising restart=%s\n",
+                    bleAdvertising ? "OK" : "FAILED");
+    }
+    ++bleDisconnectEvents;
+  }
+  void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
+    bleEncrypted = desc && desc->sec_state.encrypted;
+    Serial.printf("[ducky] pairing encrypted=%u authenticated=%u bonded=%u\n",
+                  bleEncrypted ? 1u : 0u,
+                  desc ? (unsigned)desc->sec_state.authenticated : 0u,
+                  desc ? (unsigned)desc->sec_state.bonded : 0u);
+    if (desc && !bleEncrypted) {
+      NimBLEServer* server = NimBLEDevice::getServer();
+      if (server) server->disconnect(desc->conn_handle);
     }
   }
 };
+
+class InputCB : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc* desc,
+                   uint16_t subValue) override {
+    bleSubscribed = (subValue & 0x0001u) != 0;
+    Serial.printf("[ducky] HID notifications=%s handle=%u\n",
+                  bleSubscribed ? "ON" : "OFF",
+                  desc ? (unsigned)desc->conn_handle : 0u);
+  }
+};
+
 class OutputCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c) override { (void)c; }
 };
 
+static ServerCB s_serverCallbacks;
+static InputCB s_inputCallbacks;
+static OutputCB s_outputCallbacks;
+
 static void sendKey(uint8_t usage, uint8_t mods = 0, uint16_t downMs = 10) {
-  if (!bleConnected) return;
+  if (!duckyReady()) return;
   KbdReport idle{};
   inputChr->setValue((uint8_t*)&idle, sizeof(idle)); inputChr->notify(); delay(3);
   KbdReport rpt{}; rpt.modifiers = mods; rpt.keys[0]=usage;
@@ -416,30 +600,148 @@ static void sendKey(uint8_t usage, uint8_t mods = 0, uint16_t downMs = 10) {
   inputChr->setValue((uint8_t*)&idle, sizeof(idle)); inputChr->notify(); delay(5);
 }
 
-static uint8_t keyFromChar(char c, bool& needShift) {
-  needShift = false;
-  if (c >= 'a' && c <= 'z') return KEY_A + (c - 'a');
-  if (c >= 'A' && c <= 'Z') { needShift = true; return KEY_A + (c - 'A'); }
-  if (c >= '1' && c <= '9') return KEY_1 + (c - '1');
-  if (c == '0') return KEY_0;
-  if (c == ' ') return KEY_SPACE;
-  if (c == '\n' || c == '\r') return KEY_ENTER;
-  if (c == '-') return 0x2D;  if (c == '_') { needShift = true; return 0x2D; }
-  if (c == '=') return 0x2E;  if (c == '+') { needShift = true; return 0x2E; }
-  if (c == '[') return 0x2F;  if (c == '{') { needShift = true; return 0x2F; }
-  if (c == ']') return 0x30;  if (c == '}') { needShift = true; return 0x30; }
-  if (c == '\\') return 0x31; if (c == '|') { needShift = true; return 0x31; }
-  if (c == ';') return 0x33;  if (c == ':') { needShift = true; return 0x33; }
-  if (c == '\'') return 0x34; if (c == '"'){ needShift = true; return 0x34; }
-  if (c == ',') return 0x36;  if (c == '<') { needShift = true; return 0x36; }
-  if (c == '.') return 0x37;  if (c == '>') { needShift = true; return 0x37; }
-  if (c == '/') return 0x38;  if (c == '?') { needShift = true; return 0x38; }
-  if (c == '`') return 0x35;  if (c == '~') { needShift = true; return 0x35; }
-  return 0;
+static KeyStroke usKeyFromChar(char c) {
+  if (c >= 'a' && c <= 'z') return {(uint8_t)(KEY_A + (c - 'a')), 0};
+  if (c >= 'A' && c <= 'Z') return {(uint8_t)(KEY_A + (c - 'A')), MOD_SHIFT};
+  if (c >= '1' && c <= '9') return {(uint8_t)(KEY_1 + (c - '1')), 0};
+  if (c == '0') return {KEY_0, 0};
+  switch (c) {
+    case '!': return {KEY_1, MOD_SHIFT}; case '@': return {KEY_2, MOD_SHIFT};
+    case '#': return {KEY_3, MOD_SHIFT}; case '$': return {KEY_4, MOD_SHIFT};
+    case '%': return {KEY_5, MOD_SHIFT}; case '^': return {KEY_6, MOD_SHIFT};
+    case '&': return {KEY_7, MOD_SHIFT}; case '*': return {KEY_8, MOD_SHIFT};
+    case '(': return {KEY_9, MOD_SHIFT}; case ')': return {KEY_0, MOD_SHIFT};
+    case ' ': return {KEY_SPACE, 0}; case '\n': case '\r': return {KEY_ENTER, 0};
+    case '-': return {KEY_MINUS, 0}; case '_': return {KEY_MINUS, MOD_SHIFT};
+    case '=': return {KEY_EQUAL, 0}; case '+': return {KEY_EQUAL, MOD_SHIFT};
+    case '[': return {KEY_LEFTBRACE, 0}; case '{': return {KEY_LEFTBRACE, MOD_SHIFT};
+    case ']': return {KEY_RIGHTBRACE, 0}; case '}': return {KEY_RIGHTBRACE, MOD_SHIFT};
+    case '\\': return {KEY_BACKSLASH, 0}; case '|': return {KEY_BACKSLASH, MOD_SHIFT};
+    case ';': return {KEY_SEMICOLON, 0}; case ':': return {KEY_SEMICOLON, MOD_SHIFT};
+    case '\'': return {KEY_APOSTROPHE, 0}; case '"': return {KEY_APOSTROPHE, MOD_SHIFT};
+    case ',': return {KEY_COMMA, 0}; case '<': return {KEY_COMMA, MOD_SHIFT};
+    case '.': return {KEY_DOT, 0}; case '>': return {KEY_DOT, MOD_SHIFT};
+    case '/': return {KEY_SLASH, 0}; case '?': return {KEY_SLASH, MOD_SHIFT};
+    case '`': return {KEY_GRAVE, 0}; case '~': return {KEY_GRAVE, MOD_SHIFT};
+    default: return {};
+  }
+}
+
+static KeyStroke keyForLayout(char c, KeyboardLayout layout) {
+  if (layout == KeyboardLayout::Custom && customLayoutLoaded && c >= 0x20 && c <= 0x7E) {
+    return customLayout[(uint8_t)c - 0x20];
+  }
+
+  KeyStroke k = usKeyFromChar(c);
+  const bool upper = c >= 'A' && c <= 'Z';
+  char lower = upper ? (char)(c - 'A' + 'a') : c;
+
+  if (layout == KeyboardLayout::DE) {
+    if (lower == 'y') k = {KEY_Z, (uint8_t)(upper ? MOD_SHIFT : 0)};
+    else if (lower == 'z') k = {KEY_Y, (uint8_t)(upper ? MOD_SHIFT : 0)};
+    else switch (c) {
+      case '@': k={KEY_Q,MOD_RALT}; break; case '#': k={KEY_BACKSLASH,0}; break;
+      case '^': k={KEY_GRAVE,0}; break; case '&': k={KEY_6,MOD_SHIFT}; break;
+      case '*': k={KEY_RIGHTBRACE,MOD_SHIFT}; break; case '(': k={KEY_8,MOD_SHIFT}; break;
+      case ')': k={KEY_9,MOD_SHIFT}; break; case '-': k={KEY_SLASH,0}; break;
+      case '_': k={KEY_SLASH,MOD_SHIFT}; break; case '=': k={KEY_0,MOD_SHIFT}; break;
+      case '+': k={KEY_RIGHTBRACE,0}; break; case '[': k={KEY_8,MOD_RALT}; break;
+      case ']': k={KEY_9,MOD_RALT}; break; case '\\': k={KEY_MINUS,MOD_RALT}; break;
+      case '{': k={KEY_7,MOD_RALT}; break; case '}': k={KEY_0,MOD_RALT}; break;
+      case ';': k={KEY_COMMA,MOD_SHIFT}; break; case ':': k={KEY_DOT,MOD_SHIFT}; break;
+      case '\'': k={KEY_BACKSLASH,MOD_SHIFT}; break; case '"': k={KEY_2,MOD_SHIFT}; break;
+      case '/': k={KEY_7,MOD_SHIFT}; break; case '?': k={KEY_MINUS,MOD_SHIFT}; break;
+      case '<': k={KEY_NONUS_BACKSLASH,0}; break; case '>': k={KEY_NONUS_BACKSLASH,MOD_SHIFT}; break;
+      case '|': k={KEY_NONUS_BACKSLASH,MOD_RALT}; break; default: break;
+    }
+  } else if (layout == KeyboardLayout::FR) {
+    if (lower == 'a') k={KEY_Q,(uint8_t)(upper?MOD_SHIFT:0)};
+    else if (lower == 'q') k={KEY_A,(uint8_t)(upper?MOD_SHIFT:0)};
+    else if (lower == 'w') k={KEY_Z,(uint8_t)(upper?MOD_SHIFT:0)};
+    else if (lower == 'z') k={KEY_W,(uint8_t)(upper?MOD_SHIFT:0)};
+    else if (lower == 'm') k={KEY_SEMICOLON,(uint8_t)(upper?MOD_SHIFT:0)};
+    else if (c >= '1' && c <= '9') k={(uint8_t)(KEY_1+(c-'1')),MOD_SHIFT};
+    else if (c == '0') k={KEY_0,MOD_SHIFT};
+    else switch (c) {
+      case '&': k={KEY_1,0}; break; case '"': k={KEY_3,0}; break;
+      case '\'': k={KEY_4,0}; break; case '(': k={KEY_5,0}; break;
+      case '-': k={KEY_6,0}; break; case '_': k={KEY_8,0}; break;
+      case ')': k={KEY_MINUS,0}; break; case '=': k={KEY_EQUAL,0}; break;
+      case '@': k={KEY_0,MOD_RALT}; break; case '#': k={KEY_3,MOD_RALT}; break;
+      case '$': k={KEY_RIGHTBRACE,0}; break; case '*': k={KEY_BACKSLASH,0}; break;
+      case '[': k={KEY_5,MOD_RALT}; break; case ']': k={KEY_MINUS,MOD_RALT}; break;
+      case '\\': k={KEY_8,MOD_RALT}; break; case '{': k={KEY_4,MOD_RALT}; break;
+      case '}': k={KEY_EQUAL,MOD_RALT}; break; case ';': k={KEY_COMMA,0}; break;
+      case ':': k={KEY_DOT,0}; break; case ',': k={KEY_M,0}; break;
+      case '.': k={KEY_COMMA,MOD_SHIFT}; break; case '/': k={KEY_DOT,MOD_SHIFT}; break;
+      case '?': k={KEY_M,MOD_SHIFT}; break; case '<': k={KEY_NONUS_BACKSLASH,0}; break;
+      case '>': k={KEY_NONUS_BACKSLASH,MOD_SHIFT}; break; default: break;
+    }
+  } else if (layout == KeyboardLayout::ES || layout == KeyboardLayout::LATAM ||
+             layout == KeyboardLayout::IT || layout == KeyboardLayout::PT ||
+             layout == KeyboardLayout::Brazil) {
+    const bool spanish = layout == KeyboardLayout::ES || layout == KeyboardLayout::LATAM;
+    switch (c) {
+      case '@': k={KEY_2,MOD_RALT}; break; case '#': k={KEY_3,MOD_RALT}; break;
+      case '"': k={KEY_2,MOD_SHIFT}; break; case '&': k={KEY_6,MOD_SHIFT}; break;
+      case '(': k={KEY_8,MOD_SHIFT}; break; case ')': k={KEY_9,MOD_SHIFT}; break;
+      case '=': k={KEY_0,MOD_SHIFT}; break; case '[': k={KEY_LEFTBRACE,MOD_RALT}; break;
+      case ']': k={KEY_RIGHTBRACE,MOD_RALT}; break; case '{': k={KEY_APOSTROPHE,MOD_RALT}; break;
+      case '}': k={KEY_BACKSLASH,MOD_RALT}; break; case ';': k={KEY_COMMA,MOD_SHIFT}; break;
+      case ':': k={KEY_DOT,MOD_SHIFT}; break; case '<': k={KEY_NONUS_BACKSLASH,0}; break;
+      case '>': k={KEY_NONUS_BACKSLASH,MOD_SHIFT}; break;
+      default: break;
+    }
+    if (spanish) {
+      switch (c) {
+        case '-': k={KEY_SLASH,0}; break; case '_': k={KEY_SLASH,MOD_SHIFT}; break;
+        case '+': k={KEY_RIGHTBRACE,0}; break; case '*': k={KEY_RIGHTBRACE,MOD_SHIFT}; break;
+        case '\\': k={KEY_GRAVE,MOD_RALT}; break; case '/': k={KEY_7,MOD_SHIFT}; break;
+        case '?': k={KEY_MINUS,MOD_SHIFT}; break; case '\'': k={KEY_MINUS,0}; break;
+        case '|': k={KEY_1,MOD_RALT}; break; default: break;
+      }
+    }
+  } else if (layout == KeyboardLayout::UK) {
+    switch (c) {
+      case '@': k={KEY_APOSTROPHE,MOD_SHIFT}; break; case '"': k={KEY_2,MOD_SHIFT}; break;
+      case '#': k={KEY_NONUS_HASH,0}; break; case '~': k={KEY_NONUS_HASH,MOD_SHIFT}; break;
+      case '\\': k={KEY_NONUS_BACKSLASH,0}; break; case '|': k={KEY_NONUS_BACKSLASH,MOD_SHIFT}; break;
+      default: break;
+    }
+  }
+  return k;
 }
 
 static void typeASCII(const String& s, uint16_t charDown = 10) {
-  for (size_t i=0;i<s.length();++i){ bool shift=false; uint8_t u=keyFromChar(s[i],shift); if(u) sendKey(u, shift?MOD_SHIFT:0, charDown); }
+  for (size_t i=0;i<s.length();++i){ KeyStroke k=keyForLayout(s[i],activeLayout); if(k.usage) sendKey(k.usage,k.mods,charDown); }
+}
+
+static bool loadCustomKeyboardLayout() {
+  customLayoutLoaded = false;
+  for (uint8_t c=0x20; c<=0x7E; ++c) customLayout[c-0x20]=usKeyFromChar((char)c);
+  if (!sd_mounted || !SD.exists("/ducky/layout.kmap")) return false;
+  File f=SD.open("/ducky/layout.kmap",FILE_READ);
+  if(!f) return false;
+  uint16_t mapped=0;
+  while(f.available()){
+    String line=trimCR(f.readStringUntil('\n')); line.trim();
+    if(!line.length() || line.startsWith("#") || line.startsWith("REM")) continue;
+    int eq=line.indexOf('='); int comma=line.indexOf(',',eq+1);
+    if(eq<=0 || comma<=eq) continue;
+    String charHex=line.substring(0,eq); String usageHex=line.substring(eq+1,comma);
+    String modsHex=line.substring(comma+1);
+    charHex.trim(); usageHex.trim(); modsHex.trim();
+    const uint32_t ch=strtoul(charHex.c_str(),nullptr,16);
+    const uint32_t usage=strtoul(usageHex.c_str(),nullptr,16);
+    const uint32_t mods=strtoul(modsHex.c_str(),nullptr,16);
+    if(ch<0x20 || ch>0x7E || usage>0x73 || mods>0xFF) continue;
+    customLayout[ch-0x20]={(uint8_t)usage,(uint8_t)mods};
+    ++mapped;
+  }
+  f.close();
+  customLayoutLoaded=mapped>0;
+  Serial.printf("[ducky] custom keyboard layout entries=%u\n",(unsigned)mapped);
+  return customLayoutLoaded;
 }
 
 static bool resolveKeyWord(const String& kw, uint8_t& usage, uint8_t& mods) {
@@ -448,134 +750,428 @@ static bool resolveKeyWord(const String& kw, uint8_t& usage, uint8_t& mods) {
   else if (k=="ESC"||k=="ESCAPE") usage=KEY_ESC;
   else if (k=="TAB") usage=KEY_TAB;
   else if (k=="SPACE") usage=KEY_SPACE;
-  else if (k=="BACKSPACE"||k=="DELETE") usage=KEY_BACKSPACE;
-  else if (k=="UP") usage=KEY_UP;
-  else if (k=="DOWN") usage=KEY_DOWN;
-  else if (k=="LEFT") usage=KEY_LEFT;
-  else if (k=="RIGHT") usage=KEY_RIGHT;
+  else if (k=="BACKSPACE") usage=KEY_BACKSPACE;
+  else if (k=="DELETE"||k=="DEL") usage=KEY_DELETE;
+  else if (k=="INSERT"||k=="INS") usage=KEY_INSERT;
+  else if (k=="PRINTSCREEN"||k=="PRTSC"||k=="PRINT_SCREEN") usage=KEY_PRINTSCREEN;
+  else if (k=="PAUSE"||k=="BREAK") usage=KEY_PAUSE;
+  else if (k=="MENU"||k=="APP"||k=="APPLICATION") usage=KEY_APP;
+  else if (k=="CAPSLOCK"||k=="CAPS_LOCK") usage=KEY_CAPSLOCK;
+  else if (k=="NUMLOCK"||k=="NUM_LOCK") usage=KEY_NUMLOCK;
+  else if (k=="SCROLLLOCK"||k=="SCROLL_LOCK") usage=KEY_SCROLLLOCK;
+  else if (k=="UP"||k=="UPARROW") usage=KEY_UP;
+  else if (k=="DOWN"||k=="DOWNARROW") usage=KEY_DOWN;
+  else if (k=="LEFT"||k=="LEFTARROW") usage=KEY_LEFT;
+  else if (k=="RIGHT"||k=="RIGHTARROW") usage=KEY_RIGHT;
   else if (k=="HOME") usage=KEY_HOME;
   else if (k=="END") usage=KEY_END;
   else if (k=="PGUP"||k=="PAGEUP") usage=KEY_PAGEUP;
   else if (k=="PGDN"||k=="PAGEDOWN") usage=KEY_PAGEDOWN;
-  else if (k.startsWith("F")) { int n=k.substring(1).toInt(); if(n>=1&&n<=12) usage = KEY_F1+(n-1); }
+  else if (k=="KP_SLASH") usage=KEY_KP_SLASH;
+  else if (k=="KP_ASTERISK") usage=KEY_KP_ASTERISK;
+  else if (k=="KP_MINUS") usage=KEY_KP_MINUS;
+  else if (k=="KP_PLUS") usage=KEY_KP_PLUS;
+  else if (k=="KP_ENTER") usage=KEY_KP_ENTER;
+  else if (k=="KP_DOT"||k=="KP_DECIMAL") usage=KEY_KP_DOT;
+  else if (k=="KP_EQUAL"||k=="KP_EQUALS") usage=KEY_KP_EQUAL;
+  else if (k.startsWith("KP_") && k.length()==4 && isDigit(k[3])) {
+    int n=k.substring(3).toInt(); usage=(n==0)?KEY_KP_0:(KEY_KP_1+(n-1));
+  }
+  else if (k.startsWith("F")) {
+    int n=k.substring(1).toInt();
+    if(n>=1&&n<=12) usage = KEY_F1+(n-1);
+    else if(n>=13&&n<=24) usage = KEY_F13+(n-13);
+  }
   if (usage) return true;
-  if (k.length()==1){ char c=k[0]; bool sh=false; uint8_t u=keyFromChar(c,sh); if(u){usage=u; mods=sh?MOD_SHIFT:0; return true;} }
+  if (k.length()==1){
+    char c=k[0];
+    // A key name inside a shortcut describes the physical key, not a typed
+    // character.  COMMAND Q must therefore be GUI+Q, never GUI+SHIFT+Q.
+    if(c>='A' && c<='Z') { usage=KEY_A+(c-'A'); return true; }
+    KeyStroke stroke=keyForLayout(c,activeLayout);
+    if(stroke.usage){usage=stroke.usage; mods=stroke.mods; return true;}
+  }
   return false;
 }
-static uint8_t modsFromTokens(const std::vector<String>& toks, size_t& i) {
-  uint8_t m=0;
-  while(i<toks.size()){
-    String t=toks[i]; t.toUpperCase();
-    if(t=="CTRL"||t=="CONTROL") m|=MOD_CTRL;
-    else if(t=="ALT") m|=MOD_ALT;
-    else if(t=="SHIFT") m|=MOD_SHIFT;
-    else if(t=="GUI"||t=="WIN"||t=="WINDOWS"||t=="CMD") m|=MOD_GUI;
-    else break;
-    ++i;
-  }
-  return m;
+static bool modifierFromToken(const String& token, uint8_t& modifier) {
+  String t=token; t.toUpperCase(); modifier=0;
+  if(t=="CTRL"||t=="CONTROL") modifier=MOD_CTRL;
+  else if(t=="SHIFT") modifier=MOD_SHIFT;
+  else if(t=="ALT"||t=="OPTION"||t=="OPT"||t=="OPTIOM") modifier=MOD_ALT;
+  else if(t=="GUI"||t=="WIN"||t=="WINDOWS"||t=="CMD"||t=="COMMAND") modifier=MOD_GUI;
+  else if(t=="RCTRL"||t=="RCONTROL") modifier=MOD_RCTRL;
+  else if(t=="RSHIFT") modifier=MOD_RSHIFT;
+  else if(t=="RALT"||t=="ROPTION") modifier=MOD_RALT;
+  else if(t=="RGUI"||t=="RWINDOWS"||t=="RWIN"||t=="RCMD"||t=="RCOMMAND") modifier=MOD_RGUI;
+  return modifier != 0;
 }
-static uint32_t clampDelay(int v){ if(v<0)v=0; if(v>600000)v=600000; return (uint32_t)v; }
-static void pressCombo(uint8_t usage, uint8_t mods, uint16_t downMs=50){
-  if(!bleConnected) return;
+static bool resolveConsumerWord(const String& kw, uint16_t& usage) {
+  String k=kw; k.toUpperCase(); usage=0;
+  if(k=="MK_VOLUP"||k=="VOLUMEUP"||k=="VOLUME_UP") usage=0x00E9;
+  else if(k=="MK_VOLDOWN"||k=="VOLUMEDOWN"||k=="VOLUME_DOWN") usage=0x00EA;
+  else if(k=="MK_MUTE"||k=="MUTE") usage=0x00E2;
+  else if(k=="MK_PREV"||k=="MEDIA_PREV") usage=0x00B6;
+  else if(k=="MK_NEXT"||k=="MEDIA_NEXT") usage=0x00B5;
+  else if(k=="MK_PP"||k=="MEDIA_PLAY_PAUSE"||k=="PLAY_PAUSE") usage=0x00CD;
+  else if(k=="MK_STOP"||k=="MEDIA_STOP") usage=0x00B7;
+  return usage != 0;
+}
+static void pressChord(const uint8_t* usages, size_t usageCount, uint8_t mods, uint16_t downMs=50){
+  if(!duckyReady()) return;
   KbdReport idle{}; inputChr->setValue((uint8_t*)&idle,sizeof(idle)); inputChr->notify(); delay(3);
-  KbdReport rpt{}; rpt.modifiers=mods; rpt.keys[0]=usage;
+  KbdReport rpt{}; rpt.modifiers=mods;
+  const size_t count = usageCount > sizeof(rpt.keys) ? sizeof(rpt.keys) : usageCount;
+  for(size_t i=0; i<count; ++i) rpt.keys[i]=usages[i];
   inputChr->setValue((uint8_t*)&rpt,sizeof(rpt)); inputChr->notify(); delay(downMs);
   inputChr->setValue((uint8_t*)&idle,sizeof(idle)); inputChr->notify(); delay(5);
 }
-static bool execLine(const String& raw, uint32_t& interDelay, String& err){
+static void pressCombo(uint8_t usage, uint8_t mods, uint16_t downMs=50){
+  pressChord(&usage,1,mods,downMs);
+}
+static void pressModifiers(uint8_t mods, uint16_t downMs=50){
+  if(!duckyReady()) return;
+  KbdReport idle{}; inputChr->setValue((uint8_t*)&idle,sizeof(idle)); inputChr->notify(); delay(3);
+  KbdReport rpt{}; rpt.modifiers=mods;
+  inputChr->setValue((uint8_t*)&rpt,sizeof(rpt)); inputChr->notify(); delay(downMs);
+  inputChr->setValue((uint8_t*)&idle,sizeof(idle)); inputChr->notify(); delay(5);
+}
+static void sendConsumer(uint16_t usage, uint16_t downMs=50){
+  if(!duckyReady() || !consumerInputChr) return;
+  ConsumerReport rpt{usage};
+  consumerInputChr->setValue((uint8_t*)&rpt,sizeof(rpt)); consumerInputChr->notify(); delay(downMs);
+  ConsumerReport idle{0};
+  consumerInputChr->setValue((uint8_t*)&idle,sizeof(idle)); consumerInputChr->notify(); delay(5);
+}
+static void tokenize(const String& line, std::vector<String>& out){
+  out.clear(); String tmp;
+  for(size_t i=0;i<line.length();++i){
+    char c=line[i];
+    if(c==' '||c=='\t'){ if(tmp.length()){out.push_back(tmp); tmp="";} }
+    else tmp+=c;
+  }
+  if(tmp.length()) out.push_back(tmp);
+}
+static bool parseUnsignedArg(const std::vector<String>& tok, uint32_t& value){
+  if(tok.size()!=2 || !tok[1].length()) return false;
+  uint64_t parsed=0;
+  for(size_t i=0;i<tok[1].length();++i){
+    if(!isDigit(tok[1][i])) return false;
+    parsed=parsed*10u+(uint8_t)(tok[1][i]-'0');
+    if(parsed>600000u) parsed=600000u;
+  }
+  value=(uint32_t)parsed;
+  return true;
+}
+static bool execLine(const String& raw, uint32_t& interDelay, String& err,
+                     String& previousCommand, bool repeated, bool& didExecute){
+  didExecute=false;
   String line=raw; line.trim(); if(!line.length()) return true;
   if(line.startsWith("REM")) return true;
 
-  std::vector<String> tok; { String tmp; for(size_t i=0;i<line.length();++i){ char c=line[i]; if(c==' '||c=='\t'){ if(tmp.length()){tok.push_back(tmp); tmp="";}} else tmp+=c;} if(tmp.length()) tok.push_back(tmp); }
+  std::vector<String> tok; tokenize(line,tok);
   if(tok.empty()) return true;
 
   String cmd=tok[0]; String rest=line.substring(cmd.length()); rest.trim();
   String ucmd=cmd; ucmd.toUpperCase();
 
-  if(ucmd=="DELAY"){ interDelay=clampDelay(rest.toInt()); delay(interDelay); return true; }
-  if(ucmd=="DEFAULT_DELAY"||ucmd=="DEFAULTDELAY"){ defaultDelay=clampDelay(rest.toInt()); return true; }
-  if(ucmd=="WAIT_FOR"){ delay(clampDelay(rest.toInt())); return true; }
-  if(ucmd=="STRING"){ typeASCII(rest); if(defaultDelay) delay(defaultDelay); return true; }
-  if(ucmd=="ENTER"){ sendKey(KEY_ENTER); if(defaultDelay) delay(defaultDelay); return true; }
-
-  if(ucmd=="GUI"||ucmd=="WINDOWS"||ucmd=="WIN"){
-    uint8_t usage=0; if(rest.length()){ uint8_t m=0; if(!resolveKeyWord(rest,usage,m)){ err=String("Unknown key: ")+rest; return false; } }
-    if(!usage) usage=KEY_R; pressCombo(usage, MOD_GUI); if(defaultDelay) delay(defaultDelay); return true;
-  }
-  if(ucmd=="CTRL"||ucmd=="CONTROL"||ucmd=="ALT"||ucmd=="SHIFT"){
-    size_t i=0; std::vector<String> tokens; { String s=line; String t; for(size_t j=0;j<s.length();++j){ char ch=s[j]; if(ch==' '||ch=='\t'){ if(t.length()){tokens.push_back(t); t="";}} else t+=ch;} if(t.length()) tokens.push_back(t); }
-    i=0; uint8_t mods=modsFromTokens(tokens,i);
-    if(i>=tokens.size()){ err="Missing key after modifiers"; return false; }
-    uint8_t usage=0,dummy=0; if(!resolveKeyWord(tokens[i],usage,dummy)){ err=String("Unknown key: ")+tokens[i]; return false; }
-    pressCombo(usage,mods); if(defaultDelay) delay(defaultDelay); return true;
-  }
-  if(ucmd=="TAB"||ucmd=="ESC"||ucmd=="SPACE"||ucmd=="BACKSPACE"||ucmd=="DELETE"||
-     ucmd=="UP"||ucmd=="DOWN"||ucmd=="LEFT"||ucmd=="RIGHT"||
-     ucmd=="HOME"||ucmd=="END"||ucmd=="PGUP"||ucmd=="PAGEUP"||ucmd=="PGDN"||ucmd=="PAGEDOWN"||
-     (ucmd.length()==2&&ucmd[0]=='F'&&isDigit(ucmd[1]))||
-     (ucmd.length()==3&&ucmd[0]=='F'&&isDigit(ucmd[1])&&isDigit(ucmd[2]))){
-    uint8_t usage=0,m=0; if(!resolveKeyWord(ucmd,usage,m)){ err=String("Unknown key: ")+ucmd; return false; }
-    pressCombo(usage,m); if(defaultDelay) delay(defaultDelay); return true;
-  }
   if(ucmd=="REPEAT"){
-    int n=(int)rest.toInt(); if(n<0)n=0; while(n--){ sendKey(KEY_ENTER); if(defaultDelay) delay(defaultDelay); }
+    if(repeated){ err="Nested REPEAT is not allowed"; return false; }
+    uint32_t count=0;
+    if(!parseUnsignedArg(tok,count)){ err="REPEAT requires one numeric count"; return false; }
+    if(!previousCommand.length()){ err="REPEAT has no previous command"; return false; }
+    const String replay=previousCommand;
+    while(count--){
+      bool replayExecuted=false;
+      if(!execLine(replay,interDelay,err,previousCommand,true,replayExecuted)) return false;
+      if(replayExecuted && defaultDelay) delay(defaultDelay);
+    }
     return true;
   }
+  if(ucmd=="DELAY"){
+    uint32_t value=0; if(!parseUnsignedArg(tok,value)){err="DELAY requires one numeric value";return false;}
+    interDelay=value; delay(interDelay); didExecute=true; if(!repeated) previousCommand=line; return true;
+  }
+  if(ucmd=="DEFAULT_DELAY"||ucmd=="DEFAULTDELAY"){
+    uint32_t value=0; if(!parseUnsignedArg(tok,value)){err="DEFAULT_DELAY requires one numeric value";return false;}
+    defaultDelay=value; return true;
+  }
+  if(ucmd=="DUCKY_LANG"||ucmd=="LANG"||ucmd=="KEYBOARD_LAYOUT"){
+    if(tok.size()!=2){err="Keyboard layout requires one code";return false;}
+    KeyboardLayout requested;
+    if(!parseLayoutCode(tok[1],requested)){err=String("Unknown keyboard layout: ")+tok[1];return false;}
+    if(requested==KeyboardLayout::Custom && !customLayoutLoaded){err="Custom layout.kmap not found";return false;}
+    activeLayout=requested;
+    return true;
+  }
+  if(ucmd=="WAIT_FOR"){
+    uint32_t value=0; if(!parseUnsignedArg(tok,value)){err="WAIT_FOR requires one numeric value";return false;}
+    delay(value); didExecute=true; if(!repeated) previousCommand=line; return true;
+  }
+  if(ucmd=="STRING"){ typeASCII(rest); didExecute=true; if(!repeated) previousCommand=line; return true; }
+
+  // Parse the whole line as one HID chord.  A boot-keyboard report can carry
+  // eight modifiers plus six simultaneous ordinary keys, so combinations such
+  // as COMMAND OPTION M H and COMMAND CONTROL Q are sent atomically.
+  uint8_t mods=0;
+  uint8_t keys[6]={0,0,0,0,0,0};
+  size_t keyCount=0;
+  for(size_t i=0; i<tok.size(); ++i){
+    uint8_t oneMod=0;
+    if(modifierFromToken(tok[i],oneMod)) { mods|=oneMod; continue; }
+
+    uint16_t consumer=0;
+    if(resolveConsumerWord(tok[i],consumer)){
+      if(tok.size()!=1){ err="Media keys cannot be used in a chord"; return false; }
+      sendConsumer(consumer); didExecute=true; if(!repeated) previousCommand=line; return true;
+    }
+
+    uint8_t usage=0,keyMods=0;
+    if(!resolveKeyWord(tok[i],usage,keyMods)){
+      err=String("Unknown key: ")+tok[i]; return false;
+    }
+    mods|=keyMods;
+
+    bool duplicate=false;
+    for(size_t k=0; k<keyCount; ++k) if(keys[k]==usage){ duplicate=true; break; }
+    if(duplicate) continue;
+    if(keyCount>=sizeof(keys)){ err="Too many keys in chord (maximum 6)"; return false; }
+    keys[keyCount++]=usage;
+  }
+
+  if(keyCount){
+    pressChord(keys,keyCount,mods); didExecute=true; if(!repeated) previousCommand=line; return true;
+  }
+  if(mods){
+    pressModifiers(mods); didExecute=true; if(!repeated) previousCommand=line; return true;
+  }
   err=String("Unknown command: ")+cmd; return false;
+}
+
+struct ExecHistoryEntry {
+  uint32_t number=0;
+  String text;
+};
+
+static String executionCommandLabel(const String& raw){
+  String line=raw; line.trim();
+  std::vector<String> tok; tokenize(line,tok);
+  if(tok.size()<2) return line;
+
+  bool chord=true;
+  for(size_t i=0; i<tok.size(); ++i){
+    uint8_t modifier=0,usage=0,keyMods=0;
+    if(modifierFromToken(tok[i],modifier)) continue;
+    if(resolveKeyWord(tok[i],usage,keyMods)) continue;
+    chord=false; break;
+  }
+  if(!chord) return line;
+
+  String result;
+  for(size_t i=0; i<tok.size(); ++i){
+    String part=tok[i]; part.toUpperCase();
+    if(result.length()) result += " + ";
+    result += part;
+  }
+  return result;
+}
+
+static void drawExecutionFrame(const String& path, int top){
+  tft.fillRect(0,top,DISPLAY_WIDTH,DISPLAY_HEIGHT-top,COL_BG);
+  tft.setTextColor(COL_ACCENT,COL_BG);
+  tft.drawString("LIVE EXECUTION",PADDING,top+3,2);
+  tft.setTextColor(UI_DIM_TEXT,COL_BG);
+  int slash=path.lastIndexOf('/');
+  String name=(slash>=0)?path.substring(slash+1):path;
+  tft.drawString(fitText(name,DISPLAY_WIDTH-2*PADDING,1),PADDING,top+23,1);
+  tft.drawFastHLine(PADDING,top+36,DISPLAY_WIDTH-2*PADDING,UI_LINE);
+  tft.setTextColor(UI_DIM_TEXT,COL_BG);
+  tft.drawString("CURRENT COMMAND",PADDING,top+55,1);
+  tft.drawString("RECENT ACTIVITY",PADDING,top+113,1);
+}
+
+static void drawExecutionProgress(int top, uint8_t percent, uint32_t commandNo){
+  const int x=PADDING, y=top+40, w=DISPLAY_WIDTH-2*PADDING, h=8;
+  tft.fillRoundRect(x,y,w,h,3,COL_ROWSEL);
+  const int fill=(int)((uint32_t)(w-2)*percent/100u);
+  if(fill>0) tft.fillRoundRect(x+1,y+1,fill,h-2,2,COL_ACCENT);
+  tft.fillRect(DISPLAY_WIDTH-78,top+2,78,15,COL_BG);
+  tft.setTextColor(COL_FG,COL_BG);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(String(percent)+"%  #"+String(commandNo),DISPLAY_WIDTH-PADDING,top+3,1);
+  tft.setTextDatum(TL_DATUM);
+}
+
+static void drawExecutionCurrent(int top, const String& command, const String& state, uint16_t color){
+  const int x=PADDING, y=top+68, w=DISPLAY_WIDTH-2*PADDING, h=39;
+  tft.fillRoundRect(x,y,w,h,6,COL_ROWSEL);
+  tft.drawRoundRect(x,y,w,h,6,color);
+  tft.fillRoundRect(x+5,y+7,34,24,5,color);
+  tft.setTextColor(COL_BG,color);
+  tft.drawCentreString(state,x+22,y+12,1);
+  tft.setTextColor(COL_FG,COL_ROWSEL);
+  tft.drawString(fitText(command,w-49,2),x+44,y+11,2);
+}
+
+static void drawExecutionHistory(int top, const ExecHistoryEntry* history, size_t count){
+  const int x=PADDING, startY=top+127, w=DISPLAY_WIDTH-2*PADDING, rowH=23;
+  tft.fillRect(x,startY,w,rowH*4,COL_BG);
+  for(size_t i=0; i<count && i<4; ++i){
+    const int y=startY+(int)i*rowH;
+    tft.fillRoundRect(x,y,w,rowH-3,4,COL_ROWSEL);
+    tft.setTextColor(UI_OK,COL_ROWSEL);
+    tft.drawString(String(history[i].number),x+5,y+6,1);
+    tft.setTextColor(UI_TEXT,COL_ROWSEL);
+    tft.drawString(fitText(history[i].text,w-35,1),x+29,y+6,1);
+  }
+}
+
+static void pushExecutionHistory(ExecHistoryEntry* history, size_t& count, uint32_t number, const String& text){
+  if(count<4) ++count;
+  for(size_t i=count-1; i>0; --i) history[i]=history[i-1];
+  history[0].number=number;
+  history[0].text=text.length()>80?text.substring(0,80):text;
+}
+
+static void drawExecutionResult(int top, const String& label, uint16_t color){
+  const int y=DISPLAY_HEIGHT-25;
+  tft.fillRoundRect(PADDING,y,DISPLAY_WIDTH-2*PADDING,20,5,color);
+  tft.setTextColor(COL_BG,color);
+  tft.drawCentreString(label,DISPLAY_WIDTH/2,y+5,1);
+}
+
+static bool anyDuckyPhysicalButtonPressed() {
+  return isPhysicalButtonPressed(BTN_UP) || isPhysicalButtonPressed(BTN_DOWN) ||
+         isPhysicalButtonPressed(BTN_LEFT) || isPhysicalButtonPressed(BTN_RIGHT) ||
+         isPhysicalButtonPressed(BTN_SELECT);
+}
+
+static void waitForDuckyPhysicalButton(int top) {
+  drawExecutionCurrent(top,"Press any physical button","WAIT",UI_WARN);
+  drawExecutionResult(top,"SCRIPT PAUSED",UI_WARN);
+  const int y=top+108;
+  tft.fillRect(PADDING,y,DISPLAY_WIDTH-2*PADDING,18,COL_BG);
+  tft.setTextColor(UI_TEXT,COL_BG);
+  tft.drawCentreString("Waiting for a new button press",DISPLAY_WIDTH/2,y+4,1);
+
+  // Audible confirmation is emitted once when the interpreter reaches the
+  // wait instruction. soundBeep() honours the user's Sound setting and always
+  // returns GPIO2 to input mode, which is required by the battery divider.
+  soundBeep(2450, 58);
+  delay(42);
+  soundBeep(3150, 68);
+
+  // Do not consume the button that launched the script.  The instruction
+  // resumes only after all controls have first been released and a fresh
+  // physical PCF8574 button press is observed.
+  while(anyDuckyPhysicalButtonPressed()){ delay(10); yield(); }
+  delay(35);
+  while(!anyDuckyPhysicalButtonPressed()){ delay(10); yield(); }
+  while(anyDuckyPhysicalButtonPressed()){ delay(10); yield(); }
+
+  const uint32_t now=millis();
+  ebUp.last=ebDown.last=ebLeft.last=ebRight.last=ebSelect.last=true;
+  ebUp.tLast=ebDown.tLast=ebLeft.tLast=ebRight.tLast=ebSelect.tLast=now;
+  drawExecutionResult(top,"SCRIPT RESUMED",UI_OK);
+  delay(180);
 }
 
 static bool execFile(const String& path) {
   SdFileIoGuard io(1500);
   if (!io.locked()) { lastError="SD bus busy"; return false; }
   lastError = "";
-  if (!bleConnected) { lastError="BLE not connected"; return false; }
+  if (!duckyReady()) { lastError="BLE keyboard not ready"; return false; }
   if (!mountSD())    { lastError="SD not mounted";   return false; }
   File f = SD.open(path, FILE_READ); if(!f){ lastError="Open failed"; return false; }
 
-  defaultDelay = 0; uint32_t interDelay = 0;
+  defaultDelay = 0; uint32_t interDelay = 0; String previousCommand;
+  activeLayout=selectedLayout;
 
   const int execTop = TOOLBAR_Y + HEADER_H + HEADER_H + 1;
-  tft.fillRect(0, execTop, DISPLAY_WIDTH, DISPLAY_HEIGHT - execTop, COL_BG);
-  tft.setTextColor(COL_FG, COL_BG);
-  tft.drawCentreString("Executing…", DISPLAY_WIDTH/2, execTop + 4, 2);
-  tft.drawString("File:", PADDING, execTop + 24, 2);
-  tft.drawString(path, 48, execTop + 24, 2);
+  drawExecutionFrame(path,execTop);
+  drawExecutionProgress(execTop,0,0);
+  drawExecutionCurrent(execTop,"Waiting for first command","READY",UI_ACCENT);
 
-  if (bleConnected) { KbdReport idle{}; inputChr->setValue((uint8_t*)&idle,sizeof(idle)); inputChr->notify(); delay(10); }
+  if (duckyReady()) { KbdReport idle{}; inputChr->setValue((uint8_t*)&idle,sizeof(idle)); inputChr->notify(); delay(10); }
 
-  int y = execTop + 44;
-  const int yMax = DISPLAY_HEIGHT - 6;
+  ExecHistoryEntry history[4];
+  size_t historyCount=0;
+  uint32_t commandNo=0;
+  const uint32_t fileSize=(uint32_t)f.size();
 
   ui_busy = true;
 
   while (f.available()) {
     String line = trimCR(f.readStringUntil('\n'));
+    String trimmed=line; trimmed.trim();
+    if(!trimmed.length() || trimmed.startsWith("REM")) { yield(); continue; }
+    ++commandNo;
+    const String commandLabel=executionCommandLabel(trimmed);
+    const uint8_t beforePct=fileSize?(uint8_t)(((uint64_t)f.position()*100u)/fileSize):0;
+    drawExecutionProgress(execTop,beforePct,commandNo);
+    drawExecutionCurrent(execTop,commandLabel,"RUN",COL_ACCENT);
+
+    String upperCommand=trimmed; upperCommand.toUpperCase();
+    if(upperCommand=="WAIT_FOR_BUTTON_PRESS" || upperCommand=="WAIT_FOR_BUTTON" ||
+       upperCommand=="WAIT_BUTTON"){
+      const uint32_t resumePosition=(uint32_t)f.position();
+      f.close();
+      io.release();
+      waitForDuckyPhysicalButton(execTop);
+      if(!io.acquire(1500) || !mountSD()){
+        activeLayout=selectedLayout;
+        lastError="SD unavailable after pause";
+        drawExecutionCurrent(execTop,lastError,"ERR",COL_WARN);
+        drawExecutionResult(execTop,"SCRIPT ERROR",COL_WARN);
+        ui_busy=false;
+        delay(900);
+        return false;
+      }
+      f=SD.open(path,FILE_READ);
+      if(!f || !f.seek(resumePosition)){
+        if(f) f.close();
+        activeLayout=selectedLayout;
+        lastError="Cannot resume script file";
+        drawExecutionCurrent(execTop,lastError,"ERR",COL_WARN);
+        drawExecutionResult(execTop,"SCRIPT ERROR",COL_WARN);
+        ui_busy=false;
+        delay(900);
+        return false;
+      }
+      pushExecutionHistory(history,historyCount,commandNo,"WAIT_FOR_BUTTON_PRESS");
+      drawExecutionHistory(execTop,history,historyCount);
+      drawExecutionCurrent(execTop,"Physical button received","OK",UI_OK);
+      continue;
+    }
+
     String err;
-    if (!execLine(line, interDelay, err)) {
-      lastError = err; f.close();
-      if (bleConnected) { KbdReport idle{}; inputChr->setValue((uint8_t*)&idle,sizeof(idle)); inputChr->notify(); delay(10); }
+    bool didExecute=false;
+    if (!execLine(line, interDelay, err, previousCommand, false, didExecute)) {
+      lastError = err; f.close(); activeLayout=selectedLayout;
+      if (duckyReady()) { KbdReport idle{}; inputChr->setValue((uint8_t*)&idle,sizeof(idle)); inputChr->notify(); delay(10); }
+      drawExecutionCurrent(execTop,fitText(err,DISPLAY_WIDTH-58,1),"ERR",COL_WARN);
+      drawExecutionResult(execTop,"SCRIPT ERROR",COL_WARN);
       ui_busy = false;
+      delay(900);
       return false;
     }
-    if (defaultDelay) delay(defaultDelay);
-
-    if (y < yMax) {
-      String disp = fitText(line, DISPLAY_WIDTH - 2*PADDING, 2);
-      tft.drawString(disp, PADDING, y, 2); y += 18;
-    }
+    if (didExecute && defaultDelay) delay(defaultDelay);
+    pushExecutionHistory(history,historyCount,commandNo,commandLabel);
+    drawExecutionHistory(execTop,history,historyCount);
+    const uint8_t afterPct=fileSize?(uint8_t)(((uint64_t)f.position()*100u)/fileSize):100;
+    drawExecutionProgress(execTop,afterPct,commandNo);
     yield();
   }
   f.close();
+  activeLayout=selectedLayout;
 
-  if (bleConnected) { KbdReport idle{}; inputChr->setValue((uint8_t*)&idle,sizeof(idle)); inputChr->notify(); delay(20); }
+  if (duckyReady()) { KbdReport idle{}; inputChr->setValue((uint8_t*)&idle,sizeof(idle)); inputChr->notify(); delay(20); }
 
-  tft.fillRoundRect(PADDING, DISPLAY_HEIGHT - 40, DISPLAY_WIDTH - 2*PADDING, 28, 6, COL_ACCENT);
-  tft.setTextColor(COL_BG, COL_ACCENT);
-  tft.drawCentreString("Done!", DISPLAY_WIDTH/2, DISPLAY_HEIGHT - 36, 2);
+  drawExecutionProgress(execTop,100,commandNo);
+  drawExecutionCurrent(execTop,commandNo?history[0].text:"No executable commands","DONE",UI_OK);
+  drawExecutionResult(execTop,"SCRIPT COMPLETED",UI_OK);
 
   ui_busy = false;
-  delay(500);
+  delay(700);
   return true;
 }
 
@@ -611,8 +1207,11 @@ static void drawHeader(HeaderType type, const String& title = "", bool drawFoote
       int infoY = currentY + 6;
       tft.setTextFont(1);
 
-      tft.setTextColor(bleConnected ? UI_OK : UI_WARN, COL_BG);
-      const char* bleTxt = bleConnected ? "BLE: Connected" : "BLE: Not connected";
+      const bool ready = duckyReady();
+      const char* bleTxt = ready ? "BLE: Ready" :
+                           (bleConnected ? "BLE: Pairing" :
+                            (bleAdvertising ? "BLE: Pair keyboard" : "BLE: Offline"));
+      tft.setTextColor(ready ? UI_OK : (bleAdvertising ? UI_ACCENT : UI_WARN), COL_BG);
       tft.drawString(bleTxt, PADDING, infoY, 1);
 
       tft.setTextColor(sd_mounted ? UI_OK : UI_WARN, COL_BG);
@@ -636,8 +1235,15 @@ static void drawHeader(HeaderType type, const String& title = "", bool drawFoote
 }
 
 static uint32_t lastStatusPollMs = 0;
-static bool lastHeaderBle = false;
+static uint8_t lastHeaderBleState = 0xFF;
 static bool lastHeaderSd  = false;
+
+static uint8_t currentHeaderBleState() {
+  if (duckyReady()) return 3;
+  if (bleConnected) return 2;
+  if (bleAdvertising) return 1;
+  return 0;
+}
 
 static void refreshHeaderStatusIfNeeded(bool force = false) {
   auto showAndExitNoSD = [&](const char* title, const char* subtitle) {
@@ -681,12 +1287,13 @@ static void refreshHeaderStatusIfNeeded(bool force = false) {
     }
   }
 
-  if (force || lastHeaderBle != bleConnected || lastHeaderSd != sd_mounted) {
+  const uint8_t bleState = currentHeaderBleState();
+  if (force || lastHeaderBleState != bleState || lastHeaderSd != sd_mounted) {
     uiDrawn = false;
     drawIconHeader();
 
     drawHeader(HeaderType::TextWithInfo, "", false);
-    lastHeaderBle = bleConnected;
+    lastHeaderBleState = bleState;
     lastHeaderSd  = sd_mounted;
   }
 }
@@ -1028,7 +1635,7 @@ static void drawDetailsPage() {
 static void drawSettingsPage() {
 
   drawHeader(HeaderType::IconBar);
-  drawHeader(HeaderType::TextWithInfo, "Info");
+  drawHeader(HeaderType::TextWithInfo, "BLE Ducky setup");
 
   tft.setTextColor(COL_FG, COL_BG);
   const int barY = TOOLBAR_Y;
@@ -1036,45 +1643,51 @@ static void drawSettingsPage() {
 
   tft.fillRect(0, baseY, DISPLAY_WIDTH, DISPLAY_HEIGHT - baseY - duckyFooterReserve(), COL_BG);
 
-  const int rowGap = 24;
-  int y = baseY + 8;
+  const int x=PADDING, w=DISPLAY_WIDTH-2*PADDING;
+  int y=baseY+7;
+  const char* status=duckyReady()?"Connected":(bleConnected?"Pairing":(bleAdvertising?"Ready to pair":"Offline"));
+  const uint16_t statusColor=duckyReady()?UI_OK:(bleAdvertising?UI_ACCENT:UI_WARN);
 
-  tft.setTextFont(2);
-  tft.setTextColor(UI_TEXT, COL_BG);
-  tft.drawString("Info", PADDING, y, 2);
-  y += rowGap;
+  tft.fillRoundRect(x,y,w,42,7,COL_ROWSEL);
+  tft.drawRoundRect(x,y,w,42,7,statusColor);
+  tft.fillCircle(x+17,y+21,6,statusColor);
+  tft.setTextFont(1); tft.setTextColor(UI_DIM_TEXT,COL_ROWSEL);
+  tft.drawString("BLE KEYBOARD",x+31,y+7,1);
+  tft.setTextFont(2); tft.setTextColor(COL_FG,COL_ROWSEL);
+  tft.drawString(status,x+31,y+20,2);
+  y+=49;
 
-  tft.setTextColor(COL_FG, COL_BG);
-  tft.drawString("Default Delay:", PADDING, y, 2);
-  tft.drawNumber(defaultDelay, 150, y, 2);
-  tft.drawString("ms", 190, y, 2);
-  y += rowGap;
+  const int miniGap=6, miniW=(w-miniGap)/2;
+  tft.fillRoundRect(x,y,miniW,39,6,COL_ROWSEL);
+  tft.drawRoundRect(x,y,miniW,39,6,UI_LINE);
+  tft.setTextFont(1); tft.setTextColor(UI_DIM_TEXT,COL_ROWSEL); tft.drawString("STORAGE",x+8,y+5,1);
+  tft.setTextFont(2); tft.setTextColor(sd_mounted?UI_OK:UI_WARN,COL_ROWSEL);
+  tft.drawString(sd_mounted?"SD ready":"No SD",x+8,y+18,2);
+  const int x2=x+miniW+miniGap;
+  tft.fillRoundRect(x2,y,miniW,39,6,COL_ROWSEL);
+  tft.drawRoundRect(x2,y,miniW,39,6,UI_LINE);
+  tft.setTextFont(1); tft.setTextColor(UI_DIM_TEXT,COL_ROWSEL); tft.drawString("SCRIPTS",x2+8,y+5,1);
+  tft.setTextFont(2); tft.setTextColor(COL_FG,COL_ROWSEL); tft.drawNumber((int)items.size(),x2+8,y+18,2);
+  y+=46;
 
-  tft.drawString("BLE Status:", PADDING, y, 2);
-  tft.setTextColor(bleConnected ? UI_OK : UI_WARN, COL_BG);
-  tft.drawString(bleConnected ? "Connected" : "Disconnected", 150, y, 2);
-  tft.setTextColor(COL_FG, COL_BG);
-  y += rowGap;
+  tft.fillRoundRect(x,y,w,55,7,COL_ROWSEL);
+  tft.drawRoundRect(x,y,w,55,7,COL_ACCENT);
+  tft.setTextFont(1); tft.setTextColor(UI_DIM_TEXT,COL_ROWSEL);
+  tft.drawString("KEYBOARD LAYOUT",x+10,y+6,1);
+  tft.setTextColor(COL_ACCENT,COL_ROWSEL);
+  tft.drawString("<",x+10,y+29,2);
+  tft.drawString(">",x+w-20,y+29,2);
+  tft.setTextDatum(TC_DATUM); tft.setTextFont(2); tft.setTextColor(COL_FG,COL_ROWSEL);
+  tft.drawString(layoutName(selectedLayout),x+w/2,y+24,2);
+  tft.setTextDatum(TL_DATUM);
+  y+=62;
 
-  tft.drawString("SD Status:", PADDING, y, 2);
-  tft.setTextColor(sd_mounted ? UI_OK : UI_WARN, COL_BG);
-  tft.drawString(sd_mounted ? "Mounted" : "Not mounted", 150, y, 2);
-  tft.setTextColor(COL_FG, COL_BG);
-  y += rowGap;
-
-  tft.drawString("Scripts Found:", PADDING, y, 2);
-  tft.drawNumber((int)items.size(), 150, y, 2);
-  y += rowGap;
-
-  tft.drawString("Device Name:", PADDING, y, 2);
-  tft.drawString(DEV_NAME, 150, y, 2);
-  y += rowGap;
-
-  y += 4;
-  tft.setTextFont(1);
-  tft.drawString("Use icons above for quick actions", PADDING, y, 1);
-  y += 14;
-  tft.drawString("Touch and hold for more options", PADDING, y, 1);
+  tft.fillRoundRect(x,y,w,36,6,COL_ROWSEL);
+  tft.drawRoundRect(x,y,w,36,6,UI_LINE);
+  tft.setTextFont(1); tft.setTextColor(UI_DIM_TEXT,COL_ROWSEL); tft.drawString("DEVICE",x+8,y+5,1);
+  tft.setTextColor(COL_FG,COL_ROWSEL); tft.drawString(DEV_NAME,x+8,y+18,1);
+  tft.setTextColor(UI_TEXT,COL_BG);
+  tft.drawCentreString("UP/DOWN changes layout",DISPLAY_WIDTH/2,y+42,1);
 
   if (featureHasTouchNavBar()) {
     duckyUpdateNavLabels();
@@ -1082,6 +1695,18 @@ static void drawSettingsPage() {
     FeatureUI::layoutFooter1(infoBtn, "Back", FeatureUI::ButtonStyle::Secondary);
     FeatureUI::drawButton(infoBtn);
   }
+}
+
+static void cycleKeyboardLayout(int direction) {
+  int value=(int)selectedLayout;
+  const int count=(int)KeyboardLayout::Count;
+  do {
+    value=(value+direction+count)%count;
+  } while(value==(int)KeyboardLayout::Custom && !customLayoutLoaded);
+  selectedLayout=(KeyboardLayout)value;
+  activeLayout=selectedLayout;
+  saveKeyboardLayoutPreference();
+  drawSettingsPage();
 }
 
 static void drawConfirmDelete() {
@@ -1110,59 +1735,137 @@ static void drawConfirmDelete() {
   FeatureUI::drawButton(confirmBtns[1]);
 }
 
-static void startBleKeyboard(const char* devName) {
+static bool configureDuckyAdvertising(const char* devName) {
+  NimBLEDevice::setDeviceName(devName);
 
+  // Keep the 0x1812 HID service in the primary advertisement and the complete
+  // name in the scan response.  The previous packet duplicated the name but
+  // omitted 0x1812, so several Android/Windows hosts discovered the DIV as a
+  // generic BLE peripheral and never completed keyboard pairing.
+  NimBLEAdvertisementData advData;
+  advData.setFlags(0x06);
+  advData.setAppearance(0x03C1);
+  advData.setCompleteServices(NimBLEUUID((uint16_t)0x1812));
+
+  NimBLEAdvertisementData scanRsp;
+  scanRsp.setName(devName);
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  if (!adv) {
+    bleAdvertising = false;
+    Serial.println(F("[ducky] advertising object unavailable"));
+    return false;
+  }
+
+  adv->stop();
+  adv->reset();
+  adv->setAdvertisementData(advData);
+  adv->setScanResponseData(scanRsp);
+  adv->setAdvertisementType(BLE_GAP_CONN_MODE_UND);
+  adv->setMinInterval(0x0030);
+  adv->setMaxInterval(0x0060);
+  bleAdvertising = adv->start();
+  Serial.printf("[ducky] HID advertise=%s name='%s' service=0x1812 generation=%u\n",
+                bleAdvertising ? "OK" : "FAILED", devName,
+                (unsigned)bleStackGeneration());
+  return bleAdvertising;
+}
+
+static bool startBleKeyboard(const char* devName) {
+  // The background autoscan supervisor deliberately parks NimBLE when no BLE
+  // foreground feature owns the controller.  Calling setPower() while parked
+  // reaches NimBLE's uninitialised mutex and asserts.  Ducky is the only BLE
+  // feature with its own HID server, so it must explicitly reacquire the stack
+  // before touching any NimBLE object.
+  if (!ensureBleStackReady()) {
+    Serial.println("[ducky] BLE stack unavailable; HID start aborted");
+    return false;
+  }
+
+  Serial.printf("[ducky] BLE stack ready, heap=%u\n", (unsigned)ESP.getFreeHeap());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEDevice::setDeviceName(devName);
 
   NimBLEServer* server = NimBLEDevice::createServer();
-  server->setCallbacks(new ServerCB());
+  if (!server) {
+    Serial.println(F("[ducky] server creation failed"));
+    return false;
+  }
+  server->setCallbacks(&s_serverCallbacks, false);
 
   hid = new NimBLEHIDDevice(server);
+  if (!hid) {
+    Serial.println(F("[ducky] HID allocation failed"));
+    return false;
+  }
   inputChr  = hid->inputReport(1);
+  consumerInputChr = hid->inputReport(2);
   outputChr = hid->outputReport(1);
-  outputChr->setCallbacks(new OutputCB());
+  inputChr->setCallbacks(&s_inputCallbacks);
+  outputChr->setCallbacks(&s_outputCallbacks);
 
   static const uint8_t REPORT_MAP[] = {
     0x05,0x01, 0x09,0x06, 0xA1,0x01,
     0x85,0x01, 0x05,0x07, 0x19,0xE0, 0x29,0xE7,
     0x15,0x00, 0x25,0x01, 0x75,0x01, 0x95,0x08, 0x81,0x02,
     0x75,0x08, 0x95,0x01, 0x81,0x01,
-    0x75,0x08, 0x95,0x06, 0x15,0x00, 0x25,0x65, 0x05,0x07, 0x19,0x00, 0x29,0x65, 0x81,0x00,
+    0x75,0x08, 0x95,0x06, 0x15,0x00, 0x25,0x73, 0x05,0x07, 0x19,0x00, 0x29,0x73, 0x81,0x00,
     0x05,0x08, 0x19,0x01, 0x29,0x05, 0x95,0x05, 0x75,0x01, 0x91,0x02,
     0x95,0x01, 0x75,0x03, 0x91,0x01,
-    0xC0
+    0xC0,
+    0x05,0x0C, 0x09,0x01, 0xA1,0x01, 0x85,0x02,
+    0x15,0x00, 0x26,0xFF,0x03, 0x19,0x00, 0x2A,0xFF,0x03,
+    0x75,0x10, 0x95,0x01, 0x81,0x00, 0xC0
   };
 
-  hid->manufacturer()->setValue("ESP32 Community");
-  hid->pnp(0x02, 0xE502, 0xA111, 0x0210);
+  hid->manufacturer()->setValue("MK SIGNAL");
+  hid->pnp(0x02, 0x303A, 0x4001, 0x0185);
   hid->hidInfo(0x00, 0x02);
   hid->reportMap((uint8_t*)REPORT_MAP, sizeof(REPORT_MAP));
   hid->startServices();
   hid->setBatteryLevel(100);
 
-  auto* sec = new NimBLESecurity();
-  sec->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
-  sec->setCapability(BLE_HS_IO_NO_INPUT_OUTPUT);
+  NimBLEDevice::setSecurityAuth(true, false, true);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
-  NimBLEAdvertisementData advData;
-  advData.setFlags(0x06);
-  advData.setAppearance(0x03C1);
+  hidStackGeneration = bleStackGeneration();
+  bleConnected = false;
+  bleSubscribed = false;
+  bleEncrypted = false;
+  return configureDuckyAdvertising(devName);
+}
 
-  advData.setName(devName);
+static bool resumeBleKeyboard(const char* devName) {
+  if (!ensureBleStackReady()) return false;
 
-  std::string msd; msd.push_back(0x06); msd.push_back(0x00); msd.push_back(0x00); msd.push_back(0x00); msd.push_back((char)0x80);
-  advData.setManufacturerData(msd);
+  const uint32_t generation = bleStackGeneration();
+  if (!hid) return startBleKeyboard(devName);
 
-  NimBLEAdvertisementData scanRsp; scanRsp.setName(devName);
+  NimBLEServer* server = NimBLEDevice::getServer();
+  if (!server || !inputChr || !outputChr) {
+    Serial.println(F("[ducky] retained HID state is incomplete"));
+    return false;
+  }
 
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  if (adv) adv->stop();
-  adv->setAdvertisementData(advData);
-  adv->setScanResponseData(scanRsp);
-  adv->setAdvertisementType(BLE_GAP_CONN_MODE_UND);
-  adv->setMinInterval(0x00A0);
-  adv->setMaxInterval(0x0140);
-  adv->start();
+  server->setCallbacks(&s_serverCallbacks, false);
+  inputChr->setCallbacks(&s_inputCallbacks);
+  outputChr->setCallbacks(&s_outputCallbacks);
+
+  if (hidStackGeneration != generation) {
+    // deinit(false) intentionally retains C++ objects to save heap churn, but
+    // a freshly started NimBLE host has an empty GATT registry.  Re-register
+    // the retained HID services before advertising them again.
+    Serial.printf("[ducky] restoring HID GATT generation %u -> %u\n",
+                  (unsigned)hidStackGeneration, (unsigned)generation);
+    bleConnected = false;
+    bleSubscribed = false;
+    bleEncrypted = false;
+    server->serviceChanged();
+    hidStackGeneration = generation;
+  }
+
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  return configureDuckyAdvertising(devName);
 }
 
 void enter() {
@@ -1186,34 +1889,53 @@ void enter() {
 #endif
 
   ducky_active = true;
+  lastScriptTapIndex = -1;
+  lastScriptTapTime = 0;
   setTouchButtonInputEnabled(true);
   ui_busy = false;
   dialog = Dialog::None;
   ui_inited = false;
 
-  if (!hid) startBleKeyboard(DEV_NAME);
-  else {
-    NimBLEAdvertisementData advData;
-    advData.setFlags(0x06);
-    advData.setAppearance(0x03C1);
-    advData.setName(DEV_NAME);
-    std::string msd; msd.push_back(0x06); msd.push_back(0x00); msd.push_back(0x00); msd.push_back(0x00); msd.push_back((char)0x80);
-    advData.setManufacturerData(msd);
-    NimBLEAdvertisementData scanRsp; scanRsp.setName(DEV_NAME);
-
-    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-    if (adv) {
-      adv->stop();
-      adv->setAdvertisementData(advData);
-      adv->setScanResponseData(scanRsp);
-      adv->setAdvertisementType(BLE_GAP_CONN_MODE_UND);
-      adv->setMinInterval(0x00A0);
-      adv->setMaxInterval(0x0140);
-      adv->start();
-    }
+  // Reacquire NimBLE before startBleKeyboard() or before reusing a retained
+  // HID/advertising object after BLEDevice::deinit(false).  This is safe both
+  // on a cold entry and after autoscan has parked the controller.
+  if (!ensureBleStackReady()) {
+    Serial.println("[ducky] entry cancelled: BLE stack could not be started");
+    tft.fillRect(0, TOOLBAR_Y - 1, DISPLAY_WIDTH,
+                 DISPLAY_HEIGHT - (TOOLBAR_Y - 1), COL_BG);
+    tft.setTextColor(UI_WARN, COL_BG);
+    tft.setTextFont(2);
+    tft.drawCentreString("BLE unavailable", DISPLAY_WIDTH / 2,
+                         DISPLAY_HEIGHT / 2 - 14, 2);
+    tft.setTextFont(1);
+    tft.setTextColor(UI_TEXT, COL_BG);
+    tft.drawCentreString("Returning...", DISPLAY_WIDTH / 2,
+                         DISPLAY_HEIGHT / 2 + 10, 1);
+    delay(900);
+    ducky_active = false;
+    feature_exit_requested = true;
+    return;
   }
 
-  if (hid && inputChr && bleConnected) {
+  if (!resumeBleKeyboard(DEV_NAME)) {
+    Serial.println(F("[ducky] entry cancelled: HID advertising failed"));
+    tft.fillRect(0, TOOLBAR_Y - 1, DISPLAY_WIDTH,
+                 DISPLAY_HEIGHT - (TOOLBAR_Y - 1), COL_BG);
+    tft.setTextColor(UI_WARN, COL_BG);
+    tft.setTextFont(2);
+    tft.drawCentreString("BLE HID start failed", DISPLAY_WIDTH / 2,
+                         DISPLAY_HEIGHT / 2 - 14, 2);
+    tft.setTextFont(1);
+    tft.setTextColor(UI_TEXT, COL_BG);
+    tft.drawCentreString("Restart Bluetooth and retry", DISPLAY_WIDTH / 2,
+                         DISPLAY_HEIGHT / 2 + 10, 1);
+    delay(1200);
+    ducky_active = false;
+    feature_exit_requested = true;
+    return;
+  }
+
+  if (hid && inputChr && duckyReady()) {
     KbdReport idle{}; inputChr->setValue((uint8_t*)&idle, sizeof(idle)); inputChr->notify();
   }
 
@@ -1231,6 +1953,9 @@ void enter() {
     feature_exit_requested = true;
     return;
   }
+  loadCustomKeyboardLayout();
+  loadKeyboardLayoutPreference();
+  Serial.printf("[ducky] keyboard layout=%s\n",layoutCode(selectedLayout));
   needsRedraw = true;
 }
 
@@ -1245,7 +1970,7 @@ void exit() {
   dialog = Dialog::None;
   uiDrawn = false;
 
-  if (hid && inputChr && bleConnected) {
+  if (hid && inputChr && duckyReady()) {
     KbdReport idle{};
     inputChr->setValue((uint8_t*)&idle, sizeof(idle));
     inputChr->notify();
@@ -1259,6 +1984,69 @@ void exit() {
     adv->setAdvertisementData(empty);
     adv->setScanResponseData(empty);
   }
+  bleAdvertising = false;
+
+  // End any HID session owned by this foreground feature.  Leaving a host
+  // connected while the supervisor later parks NimBLE produces a stale bond
+  // and makes the next entry look connected without a subscribed input report.
+  NimBLEServer* server = NimBLEDevice::getServer();
+  bool gapShutdownClean = true;
+  if (server && server->getConnectedCount() > 0) {
+    // NimBLEServer normally restarts advertising after a disconnect.  That
+    // happens after our callback returns and used to race deinit(false).
+    server->advertiseOnDisconnect(false);
+    const std::vector<uint16_t> peers = server->getPeerDevices();
+    const uint32_t callbackBaseline = bleDisconnectEvents;
+    uint32_t expectedCallbacks = 0;
+    for (uint16_t handle : peers) {
+      const int rc = server->disconnect(handle);
+      Serial.printf("[ducky] disconnect handle=%u rc=%d\n",
+                    (unsigned)handle, rc);
+      if (rc == 0) ++expectedCallbacks;
+    }
+
+    // GAP termination is asynchronous.  getConnectedCount() becomes zero
+    // before NimBLE finishes the application callback, so both conditions are
+    // required before the host/controller can be stopped safely.
+    const uint32_t deadline = millis() + 2500u;
+    while ((server->getConnectedCount() > 0 ||
+            (uint32_t)(bleDisconnectEvents - callbackBaseline) < expectedCallbacks) &&
+           static_cast<int32_t>(deadline - millis()) > 0) {
+      delay(10);
+    }
+
+    gapShutdownClean = server->getConnectedCount() == 0 &&
+        (uint32_t)(bleDisconnectEvents - callbackBaseline) >= expectedCallbacks;
+    if (!gapShutdownClean) {
+      // Never tear down NimBLE underneath an unfinished GAP callback.  The
+      // disconnect request remains active and will finish asynchronously.
+      Serial.println(F("[ducky] GAP disconnect timeout; controller kept alive"));
+    } else {
+      Serial.println(F("[ducky] host disconnected"));
+      // Let the host task return from BLE_GAP_EVENT_DISCONNECT completely.
+      delay(90);
+    }
+  }
+
+  // BLE HID is foreground-owned.  Stop the host/controller even when GAP
+  // reported a clean disconnect so iOS, macOS and Windows cannot keep the DIV
+  // shown as an actively connected keyboard after leaving this feature.
+  // clearAll=false preserves the reusable NimBLE objects expected by the
+  // firmware supervisor; resumeBleKeyboard() restores them on the next entry.
+  if (gapShutdownClean && NimBLEDevice::getInitialized()) {
+    // Advertising stop is also delivered through the NimBLE host task.  Give
+    // it one scheduler window before stopping the port, even when no phone was
+    // connected during this session.
+    delay(40);
+    NimBLEDevice::deinit(false);
+    Serial.printf("[ducky] HID controller stopped=%s\n",
+                  NimBLEDevice::getInitialized() ? "NO" : "YES");
+  } else if (!gapShutdownClean) {
+    Serial.println(F("[ducky] HID controller shutdown deferred"));
+  }
+  bleConnected = false;
+  bleSubscribed = false;
+  bleEncrypted = false;
 }
 void setup() {
   ducky_active = false;
@@ -1294,11 +2082,8 @@ void loop() {
     if (page == Page::List) {
       if (featureHasTouchNavBar()) {
         if (pcfPressedEdge(ebUp))   { if (sel > 0) { updateListSelection(sel - 1); } return; }
-        if (pcfPressedEdge(ebDown)) { drawListPage(true); return; }
-        if (pcfPressedEdge(ebRight)) {
-          if (sel < (int)items.size() - 1) { updateListSelection(sel + 1); }
-          return;
-        }
+        if (pcfPressedEdge(ebDown)) { if (sel < (int)items.size() - 1) { updateListSelection(sel + 1); } return; }
+        if (pcfPressedEdge(ebRight)) { drawListPage(true); return; }
         if (pcfPressedEdge(ebSelect)) {
           if (!items.empty()) { page = Page::Details; drawDetailsPage(); }
           return;
@@ -1327,10 +2112,10 @@ void loop() {
           return;
         }
         if (pcfPressedEdge(ebRight) || pcfPressedEdge(ebSelect)) {
-          if (!bleConnected) {
+          if (!duckyReady()) {
             tft.fillRoundRect(PADDING, duckyToastTop(), DISPLAY_WIDTH - 2*PADDING, 22, 6, COL_WARN);
             tft.setTextColor(COL_BG, COL_WARN);
-            tft.drawCentreString("Not paired/connected", DISPLAY_WIDTH/2, duckyToastCenterY(), 2);
+            tft.drawCentreString("Pair keyboard first", DISPLAY_WIDTH/2, duckyToastCenterY(), 2);
           } else if (!items.empty()) {
             bool ok = execFile(items[sel].path);
             drawDetailsPage();
@@ -1345,10 +2130,10 @@ void loop() {
         if (pcfPressedEdge(ebLeft)) { page = Page::List; drawListPage(false); return; }
       } else {
         if (pcfPressedEdge(ebRight) || pcfPressedEdge(ebSelect)) {
-          if (!bleConnected) {
+          if (!duckyReady()) {
             tft.fillRoundRect(PADDING, duckyToastTop(), DISPLAY_WIDTH - 2*PADDING, 22, 6, COL_WARN);
             tft.setTextColor(COL_BG, COL_WARN);
-            tft.drawCentreString("Not paired/connected", DISPLAY_WIDTH/2, duckyToastCenterY(), 2);
+            tft.drawCentreString("Pair keyboard first", DISPLAY_WIDTH/2, duckyToastCenterY(), 2);
           } else if (!items.empty()) {
             bool ok = execFile(items[sel].path);
             drawDetailsPage();
@@ -1364,6 +2149,10 @@ void loop() {
       }
     } else if (page == Page::Settings) {
       if (pcfPressedEdge(ebLeft)) { page = Page::List; drawListPage(false); return; }
+      if (pcfPressedEdge(ebUp)) { cycleKeyboardLayout(-1); return; }
+      if (pcfPressedEdge(ebDown) || pcfPressedEdge(ebRight) || pcfPressedEdge(ebSelect)) {
+        cycleKeyboardLayout(1); return;
+      }
     }
   }
 Tap tap = readTap();
@@ -1393,8 +2182,6 @@ Tap tap = readTap();
   }
 
   handleIconTouch(tap.x, tap.y);
-
-  bool doubleTap = isDoubleTap(tap);
 
   if (page == Page::List) {
     bool handledFooter = false;
@@ -1426,13 +2213,21 @@ Tap tap = readTap();
         int actualIdx = startItem + clickedRow;
 
         if (actualIdx >= 0 && actualIdx < (int)items.size()) {
-          if (doubleTap && bleConnected) {
-            bool ok = execFile(items[actualIdx].path);
-            drawListPage(false);
-            if (!ok) {
+          const int executeIdx = registerScriptRowTap(actualIdx, tap);
+          if (executeIdx >= 0 && executeIdx < (int)items.size()) {
+            if (!duckyReady()) {
               tft.fillRoundRect(PADDING, duckyToastTop(), DISPLAY_WIDTH - 2*PADDING, 22, 6, COL_WARN);
               tft.setTextColor(COL_BG, COL_WARN);
-              tft.drawCentreString(String("Error: ") + lastError, DISPLAY_WIDTH/2, duckyToastCenterY(), 2);
+              tft.drawCentreString("Pair keyboard first", DISPLAY_WIDTH/2, duckyToastCenterY(), 2);
+            } else {
+              sel = executeIdx;
+              bool ok = execFile(items[executeIdx].path);
+              drawListPage(false);
+              if (!ok) {
+                tft.fillRoundRect(PADDING, duckyToastTop(), DISPLAY_WIDTH - 2*PADDING, 22, 6, COL_WARN);
+                tft.setTextColor(COL_BG, COL_WARN);
+                tft.drawCentreString(String("Error: ") + lastError, DISPLAY_WIDTH/2, duckyToastCenterY(), 2);
+              }
             }
           } else {
             updateListSelection(actualIdx);
@@ -1445,10 +2240,10 @@ Tap tap = readTap();
     if (!featureHasTouchNavBar()) {
       int id = FeatureUI::hit(detailsBtns, 3, tap.x, tap.y);
       if (id == 0) {
-        if (!bleConnected) {
+        if (!duckyReady()) {
           tft.fillRoundRect(PADDING, duckyToastTop(), DISPLAY_WIDTH - 2*PADDING, 22, 6, COL_WARN);
           tft.setTextColor(COL_BG, COL_WARN);
-          tft.drawCentreString("Not paired/connected", DISPLAY_WIDTH/2, duckyToastCenterY(), 2);
+          tft.drawCentreString("Pair keyboard first", DISPLAY_WIDTH/2, duckyToastCenterY(), 2);
         } else if (!items.empty()) {
           bool ok = execFile(items[sel].path);
           drawDetailsPage();

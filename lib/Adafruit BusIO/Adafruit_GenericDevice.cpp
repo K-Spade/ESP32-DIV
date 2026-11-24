@@ -1,8 +1,4 @@
-/*
-   Written with help by Claude!
-  https://claude.ai/chat/335f50b1-3dd8-435e-9139-57ec7ca26a3c (at this time
-  chats are not shareable :(
-*/
+/* Adafruit Generic Device implementation. */
 
 #include "Adafruit_GenericDevice.h"
 

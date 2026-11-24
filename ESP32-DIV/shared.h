@@ -103,7 +103,7 @@ uint16_t uiUniversalColor();
 #define ESP32DIV_NAME "MK SIGNAL DIV V2.1"
 #endif
 #ifndef ESP32DIV_VERSION
-#define ESP32DIV_VERSION "1.7.2-stable-by_MK_SIGNAL_v1.81"
+#define ESP32DIV_VERSION "1.7.2-stable-by_MK_SIGNAL_v1.90"
 #endif
 #ifndef ESP32DIV_TARGET
 #define ESP32DIV_TARGET "for DIV V2.1"

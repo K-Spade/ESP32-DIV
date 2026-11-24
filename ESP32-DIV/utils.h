@@ -107,6 +107,16 @@ class SdFileIoGuard {
       : locked_(sdBeginFileIoSession(timeoutMs)) {}
   ~SdFileIoGuard() { if (locked_) sdEndFileIoSession(); }
   bool locked() const { return locked_; }
+  void release() {
+    if (locked_) {
+      sdEndFileIoSession();
+      locked_ = false;
+    }
+  }
+  bool acquire(uint32_t timeoutMs = 1000) {
+    if (!locked_) locked_ = sdBeginFileIoSession(timeoutMs);
+    return locked_;
+  }
   SdFileIoGuard(const SdFileIoGuard&) = delete;
   SdFileIoGuard& operator=(const SdFileIoGuard&) = delete;
 
@@ -168,6 +178,8 @@ void requestStatusBarRedraw();
 
 /** Init NimBLE once (releases unused Classic BT RAM first). Safe to call repeatedly. */
 bool ensureBleStackReady();
+/** Monotonic generation incremented whenever the NimBLE host is initialised. */
+uint32_t bleStackGeneration();
 
 /** Allow another SD mount attempt (clears v1 boot "gave up" latch). */
 void sdRetryMount();
